@@ -2318,6 +2318,13 @@ static uint8_t* g_hostPic; static size_t g_hostPicN;
 // frames with the matrix interpolated. g_hostTi is that frame's machine; g_hostTiPrev the latch the frame before it drew.
 static const CtTitleIntro* g_hostTi;
 static struct CtTiLatch g_hostTiPrev; static int g_hostTiPrevOk, g_hostTiChain;
+// The title's 1x frame is the ROM's picture; at the player's options (k x, wider) the host draws the title itself (CtTitleIntroRenderEx) and
+// never shows it -- so an interactive run with either option on skips the 1x render (5 ms a frame on the Switch). Debug probes that read it keep it.
+static int hostTitleSkips1x(void) {
+  static int dbg = -1; if (dbg < 0) dbg = (getenv("CT_INTROSHOT") || getenv("CT_TITLEEX_CHECK") || getenv("CT_PRESENT_SHOT") || getenv("CT_NO_TITLE_SKIP")) ? 1 : 0;
+  if (dbg || !g_hostInteractive) return 0;
+  int k = CtSettingsGet()->renderScale; return k > 1 || hostWideW() > CAMW;
+}
 static void hostUploadPictureAtImpl(CtPresenter* pr, const uint8_t* fb, int w, int t, int interp) {
   int k = g_hostInteractive ? CtSettingsGet()->renderScale : 1;
   if (k < 1) k = 1; if (k > 4) k = 4;
@@ -2327,9 +2334,24 @@ static void hostUploadPictureAtImpl(CtPresenter* pr, const uint8_t* fb, int w, i
     size_t n = (size_t)W * k * CAMH * k * 3;
     if (g_hostPicN < n) { free(g_hostPic); g_hostPic = (uint8_t*)malloc(n); g_hostPicN = g_hostPic ? n : 0; }
     if (g_hostPic) {
-      CtTitleIntroRenderEx(g_hostTi, g_hostTiPrevOk ? &g_hostTiPrev : NULL, t, g_hostPic, W, (W - CAMW) / 2, k);
+      double e0 = CtStatsNow(), e1;
       CtPresentSetPicSize(pr, W * k, CAMH * k);
-      CtPresentUpload(pr, g_hostPic);
+      // (a tiled-mode frame is drawn at 1x and upscaled by the presenter: the same pixels, a sixteenth of the render and no RGB24 picture between)
+      const struct CtTiLatch* tp = g_hostTiPrevOk ? &g_hostTiPrev : NULL;
+      static int noSmall = -1; if (noSmall < 0) noSmall = getenv("CT_NO_TITLE_SMALL") != NULL;     // (A/B switch: the full-size render)
+      int small = noSmall ? (CtTitleIntroRenderEx(g_hostTi, tp, t, g_hostPic, W, (W - CAMW) / 2, k), 0)
+                          : CtTitleIntroRenderExSmall(g_hostTi, tp, t, g_hostPic, W, (W - CAMW) / 2, k);       // (k = 1: always the full picture)
+      if (small) {
+        e1 = CtStatsNow();
+        if (!CtPresentUploadScaled(pr, g_hostPic, W, k)) {      // (no fused path on this backend: draw the full picture)
+          CtTitleIntroRenderEx(g_hostTi, g_hostTiPrevOk ? &g_hostTiPrev : NULL, t, g_hostPic, W, (W - CAMW) / 2, k);
+          CtPresentUpload(pr, g_hostPic);
+        }
+      } else {
+        e1 = CtStatsNow();
+        CtPresentUpload(pr, g_hostPic);
+      }
+      CtStatsPresent(CT_ST_TIRENDER, e1 - e0); CtStatsPresent(CT_ST_TIUP, CtStatsNow() - e1); CtStatsPresent(CT_ST_TIMODE, (double)(g_hostTi->mode & 7));      // (hoststats)
       return;
     }
   }
@@ -19016,7 +19038,7 @@ int main(int argc, char** argv) {
           // tick comes BEFORE the render, and the render draws the latch.
           seqNmiCount();                                   // C3/090F INC $08, inside the NMI
           CtTitleIntroTick(&titleIntro);
-          CtTitleIntroRender(&titleIntro, fb, CAMW, CAMH);
+          if (!hostTitleSkips1x()) CtTitleIntroRender(&titleIntro, fb, CAMW, CAMH);
           hostTitleDrew(&titleIntro);
           if (selftest && introShot != titleIntro.frame &&
               (titleIntro.frame == 0 || titleIntro.frame == 100 || titleIntro.frame == 400 ||
@@ -19070,7 +19092,7 @@ int main(int argc, char** argv) {
         else {
           seqNmiCount();                                   // C3/090F INC $08, inside the NMI
           CtTitleIntroTick(&titleIntro);
-          CtTitleIntroRender(&titleIntro, fb, CAMW, CAMH);
+          if (!hostTitleSkips1x()) CtTitleIntroRender(&titleIntro, fb, CAMW, CAMH);
           hostTitleDrew(&titleIntro);
           // CT_SEQBRITRACE=1: `seqbri: f<N> $038D=<v>` on every change of the entry's brightness (the INIDISP it writes),
           // the like-for-like counterpart of the oracle's `--monitor 7E038D:1 --diff`.

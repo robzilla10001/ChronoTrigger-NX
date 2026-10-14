@@ -19,7 +19,10 @@
 // have already advanced -- which is why CtTitleIntroTick latches first and runs the tasks after.
 #include <string.h>
 #include <stdlib.h>
+#include "SDL.h"
 #include "title_intro.h"
+#include "hoststats.h"
+#include "hostpool.h"
 #include "data/title_intro.h"
 #include "data/seq_credits.h"
 
@@ -1122,13 +1125,15 @@ static void tiOPT(const CtTitleIntro* t, const TiLine* L, int layer, int* lx, in
 // ⚠ Only BG1 and BG2 have their registers here. Mode 0 puts BG3/BG4 in the layer order, but no
 // ported stage enables them in $212C, so $2109/$210A/$210C were never derived -- a stage that does
 // enable one needs them read off its own setup, not guessed.
-static int tiBgPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int layer, int priority) {
+// The fetch, with the tile's priority bit reported instead of tested: the pixel does not depend on the priority a layer
+// is asked at, so a pixel that asks one layer at both of its priorities fetches once (tiBgPixel below = the old call).
+static int tiBgFetch(const CtTitleIntro* t, const TiLine* L, int x, int y, int layer, int* tilePri) {
   int sc = layer == 0 ? L->bg1sc : L->bg2sc;
   int adr = ((sc & 0xFC) << 8) + (((y >> 3) & 0x1F) << 5 | ((x >> 3) & 0x1F));
   if ((x & 0x100) && (sc & 1)) adr += 0x400;         // BG1SC = $65: a 64x32 map
   if ((y & 0x100) && (sc & 2)) adr += (sc & 1) ? 0x800 : 0x400;
   uint16_t tile = tiVram(t, adr);
-  if (((tile & 0x2000) != 0) != priority) return 0;
+  *tilePri = (tile & 0x2000) != 0;
   int pal = (tile & 0x1C00) >> 10;
   int row = (tile & 0x8000) ? 7 - (y & 7) : (y & 7);
   int col = (tile & 0x4000) ? (x & 7) : 7 - (x & 7);
@@ -1142,6 +1147,10 @@ static int tiBgPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int l
   uint16_t p2 = tiVram(t, chr + num * 4 * depth + 8 + row);
   px |= (((p2 >> col) & 1) << 2) | (((p2 >> (8 + col)) & 1) << 3);
   return px ? 16 * pal + px : 0;
+}
+static int tiBgPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int layer, int priority) {
+  int tp; int px = tiBgFetch(t, L, x, y, layer, &tp);
+  return tp != priority ? 0 : px;
 }
 
 // ppu_evaluateSprites: 8x8/16x16 (OBSEL = 0), name base $4000, and BOTH hardware limits -- 32
@@ -1285,6 +1294,7 @@ static int tiGetPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int 
   int screen = sub ? L->ts : L->tm;
   int clipped = sub ? L->tsw : L->tmw;         // $212E/$212F: which layers the window may clip
   int layer = 5, pixel = 0;
+  int bgPx[2], bgPri[2]; int bgHave = 0;          // layer 0/1's fetch at this pixel, shared by its two priorities
   for (int i = 0; i < n; i++) {
     int cur = lay[i], curPri = pri[i];
     int bit = cur == 4 ? 0x10 : (1 << cur);
@@ -1298,8 +1308,11 @@ static int tiGetPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int 
         if (cur > 1) continue;                       // see tiBgPixel: BG3/BG4 have no registers here
         int lx = x + ((cur == 0 ? L->bg1h : CT_TI_HOFS) & 0x3FF);
         int ly = y + ((cur == 0 ? L->bg1v : 0) & 0x3FF);
-        if (L->mode == 2) tiOPT(t, L, cur, &lx, &ly);  // offset-per-tile is modes 2/4/6, not 0
-        pixel = tiBgPixel(t, L, lx & 0x3FF, ly & 0x3FF, cur, curPri);
+        if (!(bgHave & (1 << cur))) {
+          if (L->mode == 2) tiOPT(t, L, cur, &lx, &ly);  // offset-per-tile is modes 2/4/6, not 0
+          bgPx[cur] = tiBgFetch(t, L, lx & 0x3FF, ly & 0x3FF, cur, &bgPri[cur]); bgHave |= 1 << cur;
+        }
+        pixel = bgPri[cur] != curPri ? 0 : bgPx[cur];
       }
     } else {
       pixel = (objPrio[x] == curPri) ? objPix[x] : 0;
@@ -1312,40 +1325,13 @@ static int tiGetPixel(const CtTitleIntro* t, const TiLine* L, int x, int y, int 
   return layer;
 }
 
-void CtTitleIntroRender(const CtTitleIntro* t, unsigned char* fb, int w, int h) {
-  // CGWSEL = $02 / CGADSUB = $21 for the TITLE: no clipping, ADD, no halving, fixed colour (0,0,0),
-  // and the math enabled for BG1 and the backdrop. During the swing TS = OBJ, so the copyright
-  // block and the clock are ADDED onto the mode-7 pendulum in 5-BIT space; from the moment $5C98
-  // writes $212C the subscreen is empty and the add becomes a no-op. $2131's low six bits are the
-  // per-layer enables in the LakeSnes layer order, so the credits' $00 turns the whole block off.
+// ONE LINE of the picture from its register snapshot (the line's TiLine is what the HDMA left for it): pure in everything
+// but `fb`'s own row, so the rows may be drawn in any order and on any thread.
+static void tiRenderRow(const CtTitleIntro* t, const TiLine* Lp, unsigned char* fb, int w, int y, int bri) {
+  TiLine L = *Lp;
+  int line = y + 1;                                // ⚠ the SNES renders scanlines 1..224
   uint8_t objPix[256], objPrio[256];
   memset(objPrio, 0, sizeof objPrio);
-  memset(fb, 0, (size_t)w * h * 3);
-  // $2100: bit 7 is FORCED BLANK (the whole screen is black, sprites are not even evaluated) and the
-  // low nibble scales every component on the way out -- `* brightness / 15`, AFTER the 5->8
-  // expansion, exactly where snes/ppu.c ppu_putPixels does it. This is the fade $7E:34C2 walks down.
-  int bri = t->l.bri & 0x0F;
-  if (t->l.bri & 0x80) return;
-  // The line's register file, seeded from the vblank latch. For the title and the credits it stays
-  // exactly this for all 224 lines; for a stage with HDMA it is rewritten below, per line.
-  TiLine L;
-  memset(&L, 0, sizeof L);
-  L.mode = t->mode; L.tm = t->tm; L.ts = t->ts; L.tmw = t->tmw; L.tsw = t->tsw;
-  L.cgadsub = (uint8_t)(t->cgadsub & 0x3F);
-  L.halfColor = t->halfColor; L.subtract = t->subtract; L.addSub = t->addSub;
-  L.clipMode = t->clipMode; L.preventMath = t->preventMath;
-  L.bg1sc = t->bg1sc; L.bg2sc = t->bg2sc; L.bg12nba = t->bg12nba; L.obsel = t->obsel;
-  L.win1l = t->win1l; L.win1r = t->win1r; L.win2l = t->win2l; L.win2r = t->win2r;
-  memcpy(L.win, t->win, sizeof L.win);
-  L.bg1h = t->l.bg1h; L.bg1v = t->l.bg1v; L.bg3h = t->l.bg3h;
-  for (int k = 0; k < 4; k++) L.m7[k] = t->l.m7[k];
-  TiHdmaRun run[8];
-  tiHdmaInit(t, run);                                // hPos 16 of line 0
-  for (int y = 0; y < h; y++) {
-    int line = y + 1;                                // ⚠ the SNES renders scanlines 1..224
-    // dma_doHdma fires at hPos 1104 of every visible line, i.e. after that line is drawn -- so the
-    // line about to be drawn has had exactly one run for every line above it.
-    tiHdmaRun(t, run, &L);
     const int mathEnabled[6] = { L.cgadsub & 1, (L.cgadsub >> 1) & 1, (L.cgadsub >> 2) & 1,
                                  (L.cgadsub >> 3) & 1, (L.cgadsub >> 4) & 1, (L.cgadsub >> 5) & 1 };
     tiEvalSprites(t, line - 1, objPix, objPrio);
@@ -1381,7 +1367,63 @@ void CtTitleIntroRender(const CtTitleIntro* t, unsigned char* fb, int w, int h) 
       row[x * 3 + 1] = (unsigned char)((((g << 3) | (g >> 2)) * bri) / 15);
       row[x * 3 + 2] = (unsigned char)((((b << 3) | (b >> 2)) * bri) / 15);
     }
+}
+
+// THE ROWS ON THE HOST'S POOL (hostpool.h; hoststats.h: the title's 14 ms on the console's CPU did not fit a 60 Hz frame). The
+// registers a line is drawn with come from the HDMA, which is sequential, so ONE pass snapshots all the lines' registers and
+// the rows are then drawn by whoever is free. The picture is the same pixels: no row reads another's.
+typedef struct TiJob { const CtTitleIntro* t; const TiLine* Ls; unsigned char* fb; int w, bri; } TiJob;
+static void tiRowsFn(void* ctx, int y0, int y1) {
+  const TiJob* j = (const TiJob*)ctx;
+  for (int y = y0; y < y1; y++) tiRenderRow(j->t, &j->Ls[y], j->fb, j->w, y, j->bri);
+}
+
+static void tiRenderImpl(const CtTitleIntro* t, unsigned char* fb, int w, int h) {
+  // CGWSEL = $02 / CGADSUB = $21 for the TITLE: no clipping, ADD, no halving, fixed colour (0,0,0),
+  // and the math enabled for BG1 and the backdrop. During the swing TS = OBJ, so the copyright
+  // block and the clock are ADDED onto the mode-7 pendulum in 5-BIT space; from the moment $5C98
+  // writes $212C the subscreen is empty and the add becomes a no-op. $2131's low six bits are the
+  // per-layer enables in the LakeSnes layer order, so the credits' $00 turns the whole block off.
+  uint8_t objPix[256], objPrio[256];
+  memset(objPrio, 0, sizeof objPrio);
+  memset(fb, 0, (size_t)w * h * 3);
+  // $2100: bit 7 is FORCED BLANK (the whole screen is black, sprites are not even evaluated) and the
+  // low nibble scales every component on the way out -- `* brightness / 15`, AFTER the 5->8
+  // expansion, exactly where snes/ppu.c ppu_putPixels does it. This is the fade $7E:34C2 walks down.
+  int bri = t->l.bri & 0x0F;
+  if (t->l.bri & 0x80) return;
+  // The line's register file, seeded from the vblank latch. For the title and the credits it stays
+  // exactly this for all 224 lines; for a stage with HDMA it is rewritten below, per line.
+  TiLine L;
+  memset(&L, 0, sizeof L);
+  L.mode = t->mode; L.tm = t->tm; L.ts = t->ts; L.tmw = t->tmw; L.tsw = t->tsw;
+  L.cgadsub = (uint8_t)(t->cgadsub & 0x3F);
+  L.halfColor = t->halfColor; L.subtract = t->subtract; L.addSub = t->addSub;
+  L.clipMode = t->clipMode; L.preventMath = t->preventMath;
+  L.bg1sc = t->bg1sc; L.bg2sc = t->bg2sc; L.bg12nba = t->bg12nba; L.obsel = t->obsel;
+  L.win1l = t->win1l; L.win1r = t->win1r; L.win2l = t->win2l; L.win2r = t->win2r;
+  memcpy(L.win, t->win, sizeof L.win);
+  L.bg1h = t->l.bg1h; L.bg1v = t->l.bg1v; L.bg3h = t->l.bg3h;
+  for (int k = 0; k < 4; k++) L.m7[k] = t->l.m7[k];
+  TiHdmaRun run[8];
+  tiHdmaInit(t, run);                                // hPos 16 of line 0
+  static TiLine* Ls; static int LsN;
+  if (LsN < h) { free(Ls); Ls = (TiLine*)malloc((size_t)h * sizeof *Ls); LsN = Ls ? h : 0; }
+  if (!Ls) return;
+  for (int y = 0; y < h; y++) {
+    // dma_doHdma fires at hPos 1104 of every visible line, i.e. after that line is drawn -- so the
+    // line about to be drawn has had exactly one run for every line above it.
+    tiHdmaRun(t, run, &L);
+    Ls[y] = L;
   }
+  TiJob job = { t, Ls, fb, w, bri };
+  CtParallelFor(h, 8, tiRowsFn, &job);               // bands of 8 rows, taken as a worker frees up (the cost varies by row)
+}
+
+void CtTitleIntroRender(const CtTitleIntro* t, unsigned char* fb, int w, int h) {
+  double st0 = CtStatsNow();                       // (hoststats.h: where the host's frame goes)
+  tiRenderImpl(t, fb, w, h);
+  CtStatsPresent(CT_ST_TITLE, CtStatsNow() - st0);
 }
 
 // ---- THE HOST'S OPTIONS: wider, sharper, between two frames (title_intro.h CtTitleIntroRenderEx) ---------------------
@@ -1400,6 +1442,7 @@ static int tiGetPixelEx(const CtTitleIntro* t, const TiLine* L, int x, int sub, 
   int screen = sub ? L->ts : L->tm;
   int clipped = sub ? L->tsw : L->tmw;
   int layer = 5, pixel = 0;
+  int bgPx[2], bgPri[2]; int bgHave = 0;          // layer 0/1's fetch at this pixel, shared by its two priorities
   for (int i = 0; i < n; i++) {
     int cur = lay[i], curPri = pri[i];
     int bit = cur == 4 ? 0x10 : (1 << cur);
@@ -1415,8 +1458,11 @@ static int tiGetPixelEx(const CtTitleIntro* t, const TiLine* L, int x, int sub, 
         if (cur == 0 && L->bg1Wide && (unsigned)(x + ((((L->bg1h & 0x3FF) ^ 0x200) - 0x200)) - L->bg1WinLo) >= 512u) continue;
         int lx = x + ((cur == 0 ? L->bg1h : CT_TI_HOFS) & 0x3FF);
         int ly = (L->y) + ((cur == 0 ? L->bg1v : 0) & 0x3FF);
-        if (L->mode == 2) tiOPTEx(t, L, cur, &lx, &ly);
-        pixel = tiBgPixel(t, L, lx & 0x3FF, ly & 0x3FF, cur, curPri);
+        if (!(bgHave & (1 << cur))) {
+          if (L->mode == 2) tiOPTEx(t, L, cur, &lx, &ly);
+          bgPx[cur] = tiBgFetch(t, L, lx & 0x3FF, ly & 0x3FF, cur, &bgPri[cur]); bgHave |= 1 << cur;
+        }
+        pixel = bgPri[cur] != curPri ? 0 : bgPx[cur];
       }
     } else pixel = (objPrio[x] == curPri) ? objPix[x] : 0;   // (objPix/objPrio point at the view's column 0)
     if (pixel > 0) { layer = cur; break; }
@@ -1451,6 +1497,9 @@ static void tiRowM7(const CtTitleIntro* t, const TiLine* L, const uint8_t* objPi
   long u = sxk + A * dx0, v = syk + C * dx0;
   long xp = tiFloorDiv(u, D), ru = u - xp * D, yp = tiFloorDiv(v, D), rv = v - yp * D;
   long qa = tiFloorDiv(A, D), ra = A - qa * D, qc = tiFloorDiv(C, D), rc = C - qc * D;
+  // The colour of a pixel is a function of (the mode-7 sample, the sprite pixel, its priority) alone, and these repeat in long runs: the last
+  // one is reused (the same values, not an approximation). xw steps with X / k without the division.
+  int xw = 0, sub = 0; long lastKey = -1; unsigned char cr = 0, cg = 0, cb = 0;
   for (int X = 0; X < W; X++) {
     int m7px = 0;
     if (xp >= 0 && xp < CT_M7_FIELD && yp >= 0 && yp < CT_M7_FIELD) {
@@ -1459,8 +1508,11 @@ static void tiRowM7(const CtTitleIntro* t, const TiLine* L, const uint8_t* objPi
     }
     xp += qa; ru += ra; if (ru >= D) { ru -= D; xp++; }
     yp += qc; rv += rc; if (rv >= D) { rv -= D; yp++; }
-    int xw = X / k;                                   // (the sprites are evaluated over the wide picture)
-    int obj = objPix[xw], op = objPrio[xw];
+    int obj = objPix[xw], op = objPrio[xw];            // (the sprites are evaluated over the wide picture)
+    if (++sub == k) { sub = 0; xw++; }
+    const long key = ((long)m7px << 16) | ((long)obj << 8) | op;
+    if (key == lastKey) { row[X * 3] = cr; row[X * 3 + 1] = cg; row[X * 3 + 2] = cb; continue; }
+    lastKey = key;
     // main screen: OBJ3/OBJ2/OBJ1, BG1, OBJ0, the backdrop
     int ml = 5, mp = 0;
     if ((L->tm & 0x10) && obj && op >= 1) { ml = 4; mp = obj; }
@@ -1485,9 +1537,8 @@ static void tiRowM7(const CtTitleIntro* t, const TiLine* L, const uint8_t* objPi
       if (r > 31) r = 31; if (g > 31) g = 31; if (b > 31) b = 31;
       if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
     }
-    row[X * 3 + 0] = (unsigned char)((((r << 3) | (r >> 2)) * bri) / 15);
-    row[X * 3 + 1] = (unsigned char)((((g << 3) | (g >> 2)) * bri) / 15);
-    row[X * 3 + 2] = (unsigned char)((((b << 3) | (b >> 2)) * bri) / 15);
+    cr = (unsigned char)((((r << 3) | (r >> 2)) * bri) / 15); cg = (unsigned char)((((g << 3) | (g >> 2)) * bri) / 15); cb = (unsigned char)((((b << 3) | (b >> 2)) * bri) / 15);
+    row[X * 3 + 0] = cr; row[X * 3 + 1] = cg; row[X * 3 + 2] = cb;
   }
 }
 
@@ -1517,12 +1568,31 @@ static void tiPixEx(const CtTitleIntro* t, const TiLine* Ly, int xv, int m7px, i
     o[2] = (unsigned char)((((b << 3) | (b >> 2)) * bri) / 15);
 }
 
+// THE HOST'S TITLE PICTURE, ROWS (CtTitleIntroRenderEx): every line's registers and sprites are made first, in the PPU's order (HDMA
+// rewrites them line by line); then the lines are independent and are drawn on the host's pool (hostpool.h; MSVC used OpenMP here).
+enum { TI_WMAX = 1024 };
+static TiLine g_exLines[224];
+static uint8_t g_exObjPix[224][TI_WMAX], g_exObjPrio[224][TI_WMAX];
+typedef struct { const CtTitleIntro* t; int k, w1, x0, W, bri; unsigned char* out; } TiExJob;
+static void tiExRows(void* ctx, int yA, int yB);
+
+static int tiRenderExImpl(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out, int w1, int x0, int k, int allowSmall);
 void CtTitleIntroRenderEx(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out,
                           int w1, int x0, int k) {
+  tiRenderExImpl(t, prev, t256, out, w1, x0, k, 0);
+}
+// As CtTitleIntroRenderEx, but a frame none of whose lines is mode 7 (the logo, the copyright: the tiled modes) is exactly its 1x wide picture with every
+// pixel repeated k x k times, so it is drawn at 1x into `out` (w1 x 224) and 1 is returned -- the caller upscales it (present.h CtPresentUploadScaled).
+// Returns 0 when `out` holds the full k x picture.
+int CtTitleIntroRenderExSmall(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out, int w1, int x0, int k) {
+  return tiRenderExImpl(t, prev, t256, out, w1, x0, k, 1);
+}
+static int tiRenderExImpl(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out,
+                          int w1, int x0, int k, int allowSmall) {
   if (k < 1) k = 1;
-  const int W = w1 * k, H = 224 * k;
-  memset(out, 0, (size_t)W * H * 3);
-  if (t->l.bri & 0x80) return;
+  int W = w1 * k, H = 224 * k;
+  if (t->l.bri & 0x80) { memset(out, 0, (size_t)W * H * 3); return 0; }       // (otherwise each row clears its own, on the pool)
+  if (w1 > TI_WMAX) { memset(out, 0, (size_t)W * H * 3); return 0; }
   int bri = t->l.bri & 0x0F;
   TiLine L;
   memset(&L, 0, sizeof L);
@@ -1561,25 +1631,30 @@ void CtTitleIntroRenderEx(const CtTitleIntro* t, const struct CtTiLatch* prev, i
   L.bg1Wide = slide && (L.bg1sc & 1); L.bg1WinLo = slide ? t->slideEnd - 128 : 0;
   // Every line's registers and sprites first, in the PPU's order (HDMA rewrites them line by line); then the lines are
   // independent and are drawn in parallel.
-  static TiLine lines[224];
-  enum { TI_WMAX = 1024 };
-  static uint8_t objPixL[224][TI_WMAX], objPrioL[224][TI_WMAX];
-  if (w1 > TI_WMAX) return;
   TiHdmaRun run[8];
   tiHdmaInit(t, run);
   for (int y = 0; y < 224; y++) {
     tiHdmaRun(t, run, &L);
     L.y = y + 1;
-    lines[y] = L;
-    memset(objPrioL[y], 0, (size_t)w1);
-    tiEvalSpritesEx(t, y, objPixL[y], objPrioL[y], w1, x0);
+    g_exLines[y] = L;                                // (the line's sprites are evaluated in tiExRows: they need only `t` and the line)
   }
-  int yy;
-  #pragma omp parallel for schedule(dynamic, 8)
-  for (yy = 0; yy < 224; yy++) {
-    const int y = yy;
-    const TiLine* Ly = &lines[y];
-    const uint8_t* objPix = objPixL[y]; const uint8_t* objPrio = objPrioL[y];
+  int small = 0;
+  if (allowSmall && k > 1) { small = 1; for (int y = 0; y < 224; y++) if (g_exLines[y].mode == 7) { small = 0; break; } }
+  if (small) { k = 1; W = w1; }
+  TiExJob job = { t, k, w1, x0, W, bri, out };
+  CtParallelFor(224, 4, tiExRows, &job);
+  return small;
+}
+
+static void tiExRows(void* ctx, int yA, int yB) {
+  const TiExJob* J = (const TiExJob*)ctx;
+  const CtTitleIntro* t = J->t; const int k = J->k, w1 = J->w1, x0 = J->x0, W = J->W, bri = J->bri; unsigned char* out = J->out;
+  for (int y = yA; y < yB; y++) {
+    memset(J->out + (size_t)y * k * W * 3, 0, (size_t)k * W * 3);              // (the rows this line owns: black until drawn)
+    memset(g_exObjPrio[y], 0, (size_t)w1);
+    tiEvalSpritesEx(t, y, g_exObjPix[y], g_exObjPrio[y], w1, x0);
+    const TiLine* Ly = &g_exLines[y];
+    const uint8_t* objPix = g_exObjPix[y]; const uint8_t* objPrio = g_exObjPrio[y];
     const uint8_t* objPixV = objPix + x0; const uint8_t* objPrioV = objPrio + x0;   // (indexed by the view's x)
     int line = y + 1;
     TiM7Start m0 = tiM7Starts(Ly, line & 0xFF), m1 = tiM7Starts(Ly, (line + 1) & 0xFF);
@@ -1597,7 +1672,8 @@ void CtTitleIntroRenderEx(const CtTitleIntro* t, const struct CtTiLatch* prev, i
           if (!inView && !Ly->bg1Wide) continue;   // (black: the pillarbox)
           unsigned char px[3];
           tiPixEx(t, Ly, xv, 0, inView, objPixV, objPrioV, bri, px);
-          for (int i = 0; i < k; i++) memcpy(row + ((size_t)xw * k + i) * 3, px, 3);
+          unsigned char* d = row + (size_t)xw * k * 3;
+          for (int i = 0; i < k; i++, d += 3) { d[0] = px[0]; d[1] = px[1]; d[2] = px[2]; }
         }
         continue;
       }

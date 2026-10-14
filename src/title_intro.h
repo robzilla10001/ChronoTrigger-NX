@@ -178,5 +178,6 @@ void CtTitleIntroRender(const CtTitleIntro* t, unsigned char* fb, int w, int h);
 // past the 256 columns (the tiled modes' maps wrap there: black, as a pillarbox). Output: RGB, (w1 * k) x (224 * k).
 void CtTitleIntroRenderEx(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out,
                           int w1, int x0, int k);
+int CtTitleIntroRenderExSmall(const CtTitleIntro* t, const struct CtTiLatch* prev, int t256, unsigned char* out, int w1, int x0, int k);   // 1 = `out` is the 1x wide picture (tiled modes only): upscale it k x k
 
 #endif
