@@ -572,20 +572,25 @@ static int uploadDriver(CtAudio* a, const uint8_t* rom, long romLen) {
 
 // ---- the handshake entry points, timed (see audio.h) ----
 double (*CtAudioClockHook)(void) = NULL;
+// The host may run the sound's frame on its own thread (field.c: AudJob); it sets this to wait for it. Every entry point below calls audJoin() first.
+void (*CtAudioJoinHook)(void) = NULL;
+// Which entry points join: the ones that run or read the SPC / DSP / FIFO (the frame job's data). The setters of the loader's parameters (read only by the
+// handshake, which joins) and the read-only ROM-data getters do not -- joining there would wait for the job on every frame.
+static inline void audJoin(void) { if (CtAudioJoinHook) CtAudioJoinHook(); }
 static double g_audHeavyAcc;
 double CtAudioHeavyTakeMs(void) { double r = g_audHeavyAcc; g_audHeavyAcc = 0; return r; }
 static int audioServiceImpl(CtAudio* a, uint8_t* mem7E);
 static int audioColdBootImpl(CtAudio* a, long long* master, int* frames);
 static int audioWaitReplyImpl(CtAudio* a, int* frames);
-int CtAudioService(CtAudio* a, uint8_t* mem7E) {
+int CtAudioService(CtAudio* a, uint8_t* mem7E) { audJoin();
   double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioServiceImpl(a, mem7E);
   if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
 }
-int CtAudioColdBoot(CtAudio* a, long long* master, int* frames) {
+int CtAudioColdBoot(CtAudio* a, long long* master, int* frames) { audJoin();
   double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioColdBootImpl(a, master, frames);
   if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
 }
-int CtAudioWaitReplyNibble(CtAudio* a, int* frames) {
+int CtAudioWaitReplyNibble(CtAudio* a, int* frames) { audJoin();
   double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioWaitReplyImpl(a, frames);
   if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
 }
@@ -1054,7 +1059,7 @@ static void sndCull(uint8_t* m) {
 // The loader proper. `cmd` is the mailbox command ($10/$11/$14/$15); `m` is the engine's $7E page.
 // Returns 1 when the song was loaded, 0 when the driver ABORTED it ($C7:0A80) or the load hit an
 // unported boundary, -1 on a structural refusal. Blocking, by the ROM's own design.
-int CtAudioLoadSong(CtAudio* a, uint8_t* m, int songId, uint8_t cmd) {
+int CtAudioLoadSong(CtAudio* a, uint8_t* m, int songId, uint8_t cmd) { audJoin();
   if (!a || !a->ready || !m || !a->rom) return -1;   // m == NULL is a real case: the overworld has no VM
   g_sndUnits = g_sndBytes = g_sndBlocks = 0; g_sndSpcCycles = 0; g_sndSettleCycles = 0; g_sndMovedBytes = 0;
   int nsong = CtAudioSongCount(a);
@@ -1420,7 +1425,7 @@ CtAudio* CtAudioInit(const uint8_t* rom, long romLen) {
   return a;
 }
 
-void CtAudioFree(CtAudio* a) {
+void CtAudioFree(CtAudio* a) { audJoin();
   if (!a) return;
   if (a->apu) apu_free(a->apu);
   free(a->shell);
@@ -1429,7 +1434,7 @@ void CtAudioFree(CtAudio* a) {
 
 int CtAudioReady(const CtAudio* a) { return a && a->ready; }
 
-void CtAudioFrame(CtAudio* a) {
+void CtAudioFrame(CtAudio* a) { audJoin();
   if (!a) return;
   { static int ck = -1; static long fr = 0; if (ck < 0) { const char* e = getenv("CT_AUDIO_SPCCLOCK"); ck = (e && *e) ? 1 : 0; }
     if (ck) fprintf(stderr, "spcclock pass%ld total=%lld carry=%.1f" "\n", fr++, g_apuTotal, a->cycleCarry); }
@@ -1441,7 +1446,7 @@ void CtAudioFrame(CtAudio* a) {
   a->cycleCarry = want - (double)ran;                  // carry it, so long runs do not drift
 }
 
-void CtAudioSamples(CtAudio* a, int16_t* out, int samples) {
+void CtAudioSamples(CtAudio* a, int16_t* out, int samples) { audJoin();
   if (!a || !out || samples <= 0) return;
   audTake(a);                                          // a translated stage's bus runs this SPC without apuRun
   // One frame of the stream: the next 534 samples (32040*32/60 APU cycles = 17088 = 534 x 32, the frame CtAudioFrame
@@ -1502,7 +1507,7 @@ void CtAudioSamples(CtAudio* a, int16_t* out, int samples) {
   }
 }
 
-int CtAudioPost(CtAudio* a, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3) {
+int CtAudioPost(CtAudio* a, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3) { audJoin();
   if (!a || !a->ready) return 0;
   // $C7:061C, in the ROM's own order: high port first, $2140 last -- $2140 is
   // the one the driver polls, so it must be written after its operands.
@@ -1619,7 +1624,7 @@ static int audioWaitReplyImpl(CtAudio* a, int* frames) {
 // DSP's voice state are copied whole and only the object pointers are re-planted. After this the
 // emulated driver is IN THE ORACLE'S STATE -- the same song playing, the same resident sets in ARAM,
 // the same timers -- so a clocked load runs the transfer the oracle is about to run, not a cold one.
-void CtAudioSeedFromApu(CtAudio* a, const Apu* src) {
+void CtAudioSeedFromApu(CtAudio* a, const Apu* src) { audJoin();
   if (!a || !src || !a->apu) return;
   Apu* d = a->apu; Snes* shell = d->snes; Spc* spc = d->spc; Dsp* dsp = d->dsp;
   memcpy(d, src, sizeof *d); d->snes = shell; d->spc = spc; d->dsp = dsp;
@@ -1630,7 +1635,7 @@ void CtAudioSeedFromApu(CtAudio* a, const Apu* src) {
   audReset(a);
 }
 void CtAudioSetEngineMode(CtAudio* a, int mode) { if (a) a->engineMode = (mode >= 0 && mode <= 2) ? mode : 0; }   // 2 = the loader's quiet background
-void CtAudioSetPostLine(CtAudio* a, int vPos)   { if (a) a->postLine = vPos; }
+void CtAudioSetPostLine(CtAudio* a, int vPos) { if (a) a->postLine = vPos; }
 void CtAudioSetRulePost(CtAudio* a, long postAt, long nmiWait) { if (a) { a->rulePostAt = postAt; a->ruleNmiWait = nmiWait; } }
 void CtAudioSetRuleNmiOff(CtAudio* a, int off) { if (a) a->ruleNmiOff = off ? 1 : 0; }
 void CtAudioSetRuleOff(CtAudio* a, int off) { if (a) a->ruleOff = off ? 1 : 0; }
@@ -1651,7 +1656,7 @@ long long CtAudioLastPostRaster(const CtAudio* a, int* frames, int* endLine, lon
   return a->lastMaster;
 }
 
-void CtAudioSeedMailboxPage(const CtAudio* a, uint8_t* mem7E) {
+void CtAudioSeedMailboxPage(const CtAudio* a, uint8_t* mem7E) { audJoin();
   if (!a || !mem7E) return;
   uint8_t* m = mem7E;
   memset(m + 0x1E00, 0, 0x100);                        // $C7:00FF tail (§7 step 6)
@@ -1667,22 +1672,22 @@ void CtAudioSeedMailboxPage(const CtAudio* a, uint8_t* mem7E) {
   m[0x1E00] = 0x00;
 }
 
-const uint8_t* CtAudioAram(const CtAudio* a) { return a ? a->apu->ram : NULL; }
-struct Apu* CtAudioApu(CtAudio* a) { return a ? a->apu : NULL; }
+const uint8_t* CtAudioAram(const CtAudio* a) { audJoin(); return a ? a->apu->ram : NULL; }
+struct Apu* CtAudioApu(CtAudio* a) { audJoin(); return a ? a->apu : NULL; }
 
-uint32_t CtAudioAramFnv(const CtAudio* a) {
+uint32_t CtAudioAramFnv(const CtAudio* a) { audJoin();
   if (!a) return 0;
   uint32_t h = 2166136261u;
   for (int i = 0; i < 0x10000; i++) h = (h ^ a->apu->ram[i]) * 16777619u;
   return h;
 }
 
-void CtAudioPorts(const CtAudio* a, uint8_t in[4], uint8_t out[4]) {
+void CtAudioPorts(const CtAudio* a, uint8_t in[4], uint8_t out[4]) { audJoin();
   if (!a) return;
   for (int i = 0; i < 4; i++) { if (in) in[i] = a->apu->inPorts[i]; if (out) out[i] = a->apu->outPorts[i]; }
 }
 
-int CtAudioVoicesSounding(const CtAudio* a) {
+int CtAudioVoicesSounding(const CtAudio* a) { audJoin();
   if (!a) return 0;
   int n = 0;
   for (int c = 0; c < 8; c++) if (a->apu->dsp->channel[c].gain) n++;

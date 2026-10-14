@@ -151,4 +151,5 @@ uint32_t       CtAudioAramFnv(const CtAudio* a);   // FNV-1a/32 over all of ARAM
 void           CtAudioPorts(const CtAudio* a, uint8_t in[4], uint8_t out[4]);
 int            CtAudioVoicesSounding(const CtAudio* a);   // DSP voices with gain != 0
 
+extern void (*CtAudioJoinHook)(void);   // host: waits for the sound frame job (field.c); NULL = none
 #endif

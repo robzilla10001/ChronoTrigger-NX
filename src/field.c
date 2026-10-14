@@ -4864,6 +4864,58 @@ static int fieldSoundPostBattleRule(void* ctx, uint8_t* mem7E, int nmiLine, int 
   CtAudioSetRuleIrq(a, -1);
   return hostSyncFree() ? 0 : fr;                    // (the free mode: the fight never stalls on its SPC)
 }
+// ---- the sound's frame as a job (see the call site in the main loop) ----
+typedef struct {
+  CtAudio* audio; SDL_AudioDeviceID dev; int16_t* buf; int spf, ticks, noSpc, seeded, frameNo, pending;
+  int nRec; unsigned recQ[4]; int recDrop[4]; double ms;
+  long paceTicks, paceQueued, paceSkipped, paceMaxQ;
+} AudJob;
+static AudJob g_audJob;
+static void fieldAudioJoin(void) { double t0 = CtStatsNow(); CtAsyncJoin(); double d = CtStatsNow() - t0; if (d > 0.05) CtStatsPresent(CT_ST_XJOIN, d); }
+static void fieldAudioJob(void* ctx) {
+  AudJob* j = (AudJob*)ctx; double t0 = CtStatsNow();
+  for (int t = 0; t < j->ticks; t++) {
+    static int ruleSeededFirst = 1;
+    if (j->seeded && ruleSeededFirst) { ruleSeededFirst = 0; continue; }   // (the rule: the first slice runs after the first posts)
+    if (!j->noSpc) CtAudioFrame(j->audio);                                  // a translated stage's bus drives the SPC itself
+    if (j->dev && j->buf) {
+      // THE LEVEL GATE, from the vendored LakeSnes reference (main.c:323): queue only while the device holds at most 6 frames. The frame's
+      // samples are TAKEN every tick and only QUEUED under the gate (the reference's own order).
+      Uint32 q = SDL_GetQueuedAudioSize(j->dev);
+      if ((long)q > j->paceMaxQ) j->paceMaxQ = (long)q;
+      CtAudioSamples(j->audio, j->buf, j->spf);
+      if (j->nRec < 4) { j->recQ[j->nRec] = (unsigned)q; j->recDrop[j->nRec] = q > (Uint32)j->spf * 4 * 6; j->nRec++; }
+#ifdef __SWITCH__
+      // A JITTER CUSHION (host only): one long frame (a scene load, a 30 ms spike: hoststats) empties a 1-3 frame queue and the device plays a
+      // gap = a click. Prime the queue with three frames of silence, and again after any run-dry. ~50 ms of latency.
+      { static int cushioned = 0; static int16_t silence[8192];
+        if ((!cushioned || q == 0) && j->spf * 2 <= 8192) {
+          for (int k = 0; k < 3; k++) SDL_QueueAudio(j->dev, silence, (Uint32)j->spf * 4);
+          cushioned = 1; q += (Uint32)j->spf * 12;
+        } }
+#endif
+      if (q <= (Uint32)j->spf * 4 * 6) {
+        { const CtSettings* st = CtSettingsGet();           // the player's volume (settings.h), on the output only
+          if (st->mute || st->volume < 100) {
+            int g = st->mute ? 0 : st->volume;
+            for (int i = 0; i < j->spf * 2; i++) j->buf[i] = (int16_t)(j->buf[i] * g / 100);
+          } }
+        SDL_QueueAudio(j->dev, j->buf, (Uint32)j->spf * 4);
+        j->paceQueued++;
+      } else { j->paceSkipped++;
+               if (hostTrace()) fprintf(stderr, "host: frame %d audio block dropped by the level gate (queue %u B)\n", j->frameNo, (unsigned)q); }
+    }
+    j->paceTicks++;
+  }
+  j->ms = CtStatsNow() - t0;
+}
+// The job's numbers go to the stats from the main thread (the counters are not locked). Joins first.
+static void fieldAudioReport(AudJob* j) {
+  if (j->pending) { CtAsyncJoin(); j->pending = 0; }
+  else if (!j->nRec && j->ms == 0.0) return;
+  for (int i = 0; i < j->nRec; i++) CtStatsAudio(j->recQ[i], j->recDrop[i]);
+  CtStatsPresent(CT_ST_AUDIO, j->ms); j->nRec = 0; j->ms = 0.0;
+}
 static void fieldSoundFrameSpc(void* ctx) { CtAudioFrame((CtAudio*)ctx); }   // a headless fight's frame of SPC (the rule)
 // The event VM's sink: the same JSL, PRICED -- the loader clock's frames crossed and return line, so
 // the VM can lose the frames a synchronous song upload costs the ROM (song_load_freeze.md section 6).
@@ -11509,7 +11561,7 @@ int main(int argc, char** argv) {
       // ~0.5 s -> 24 ticks). CT_AUDIO_LOCKSTEP=1 (debug) gives it the paced host's relation: one SPC frame per engine
       // frame, so "entry + N frames" means the same thing on both sides.
       { static Uint32 audioT0 = 0; static double audioAcc = 0.0;
-        static long paceTicks = 0, paceQueued = 0, paceSkipped = 0, paceMaxQ = 0, paceIrregular = 0;
+        static long paceIrregular = 0;       /* (the other pace counters are the audio job's: g_audJob) */
         Uint32 nowMs = SDL_GetTicks();
         if (!audioT0) audioT0 = nowMs;
         audioAcc += (double)(nowMs - audioT0) * 60.0 / 1000.0;
@@ -11520,36 +11572,18 @@ int main(int argc, char** argv) {
           if (lockstep < 0) lockstep = getenv("CT_AUDIO_LOCKSTEP") ? 1 : 0;
           if (lockstep || g_sndPaced || ruleSpc) { ticks = 1; audioAcc = 0.0; } }   // (the rule: a frame of SPC a frame)
         if (ticks != 1) paceIrregular++;
-        for (int t = 0; t < ticks; t++) {
-          // (the rule, an SPC seeded from the lockstep oracle's state: the state stands at a vblank and the first frame's
-          // posts belong to that slice, so the first slice runs after them -- one pass later, as --vmdiff runs it)
-          static int ruleSeededFirst = 1;
-          if (ruleSeeded && ruleSeededFirst) { ruleSeededFirst = 0; continue; }
-          if (!seqX && !gwX) CtAudioFrame(audio);           // a translated stage's bus drives the SPC itself
-          if (audioDev && audioBuf) {
-            // THE LEVEL GATE, from the vendored LakeSnes reference this engine's audio is ported from
-            // (_vendor_LakeSnes/main.c:323 `if (SDL_GetQueuedAudioSize(dev) <= wantedSamples * 4 * 6)`):
-            // queue only while the device holds at most 6 frames (100 ms). The device drains at exactly
-            // 48000 Hz, so the queue self-levels there and never needs a catastrophic clear -- the
-            // dropped block is one 1/60 s at a 100 ms backlog, instead of 266 ms dumped at 266 ms.
-            Uint32 q = SDL_GetQueuedAudioSize(audioDev);
-            if ((long)q > paceMaxQ) paceMaxQ = (long)q;
-            // The frame's samples are TAKEN every tick and only QUEUED under the gate -- the reference's own order
-            // (it generates a frame of audio whether or not it hands it over), so the output stream a probe reads
-            // (CT_AUDIO_PCM) does not depend on how fast the device drains.
-            CtAudioSamples(audio, audioBuf, audioSamplesPerFrame);
-            if (q <= (Uint32)audioSamplesPerFrame * 4 * 6) {
-              { const CtSettings* st = CtSettingsGet();           // the player's volume (settings.h), on the output only
-                if (st->mute || st->volume < 100) {
-                  int g = st->mute ? 0 : st->volume;
-                  for (int i = 0; i < audioSamplesPerFrame * 2; i++) audioBuf[i] = (int16_t)(audioBuf[i] * g / 100);
-                } }
-              SDL_QueueAudio(audioDev, audioBuf, (Uint32)audioSamplesPerFrame * 4);
-              paceQueued++;
-            } else { paceSkipped++;
-                     if (hostTrace()) fprintf(stderr, "host: frame %d audio block dropped by the level gate (queue %u B)\n", frameNo, (unsigned)q); }
-          }
-          paceTicks++;
+        { static int asyncOk = -1;
+          if (asyncOk < 0) asyncOk = (!getenv("CT_AUDIO_PACE") && !getenv("CT_AUDIO_VOICETRACE")) ? 1 : 0;
+          AudJob* j = &g_audJob;
+          fieldAudioReport(j);                                         // the previous pass's numbers (its job has finished or is joined here)
+          j->audio = audio; j->dev = audioDev; j->buf = audioBuf; j->spf = audioSamplesPerFrame; j->ticks = ticks;
+          j->noSpc = (seqX || gwX); j->seeded = ruleSeeded; j->frameNo = frameNo; j->nRec = 0;
+          // The sound's frame (SPC + resample + queue) is the one part of the frame nothing else waits for: on its own thread it runs beside
+          // the picture's compose, and every audio entry point (audio.c) joins it first, so no other code sees the SPC mid-frame.
+          // A pass that hands the SPC to a translated stage, or a seeded one, runs inline.
+          if (asyncOk > 0 && !CtAudioJoinHook) CtAudioJoinHook = fieldAudioJoin;
+          if (asyncOk && !j->noSpc && !j->seeded && audio && CtAsyncAvailable()) { j->pending = 1; CtAsyncRun(fieldAudioJob, j); }
+          else { fieldAudioJob(j); fieldAudioReport(j); }
         }
         // CT_AUDIO_PACE=<iterations>: the honest pacing signature, over the window from pass 60 (past the boot's
         // loads) to <iterations>. Neither a crackle nor a song that ends early can be heard headless -- but both are
@@ -11565,18 +11599,18 @@ int main(int argc, char** argv) {
           if (paceAt == -2) { const char* e = getenv("CT_AUDIO_PACE"); paceAt = e ? atoi(e) : -1;
                               paceWarm = paceAt > 120 ? 60 : 0; }
           if (paceAt > 0 && w0Ms < 0 && frameNo >= paceWarm) {
-            w0Ms = hostNowMs(); w0Drop = g_hostDroppedMs; w0Frame = frameNo; w0Ticks = paceTicks;
+            w0Ms = hostNowMs(); w0Drop = g_hostDroppedMs; w0Frame = frameNo; w0Ticks = g_audJob.paceTicks;
             w0Irr = paceIrregular; w0Skips = g_hostPresentSkips; w0Re = g_hostReanchors;
           }
           if (paceAt > 0 && !paceDone && frameNo >= paceAt) {
             paceDone = 1;
             double elapsed = hostNowMs() - w0Ms, dropped = g_hostDroppedMs - w0Drop;
             double expect = (elapsed - dropped) * 60.0 / 1000.0;
-            long frames = frameNo - w0Frame, ticks = paceTicks - w0Ticks, irregular = paceIrregular - w0Irr;
+            long frames = frameNo - w0Frame, ticks = g_audJob.paceTicks - w0Ticks, irregular = paceIrregular - w0Irr;
             double drift = (double)frames - expect;
             printf("audiopace: iters=%d frames=%ld ticks=%ld irregular=%ld queued=%ld skipped=%ld maxq=%ld"
                    " elapsedMs=%.0f expect=%.1f drift=%+.1f presentskips=%ld reanchors=%ld droppedMs=%.0f verdict=%s\n",
-                   frameNo, frames, ticks, irregular, paceQueued, paceSkipped, paceMaxQ, elapsed, expect, drift,
+                   frameNo, frames, ticks, irregular, g_audJob.paceQueued, g_audJob.paceSkipped, g_audJob.paceMaxQ, elapsed, expect, drift,
                    g_hostPresentSkips - w0Skips, g_hostReanchors - w0Re, dropped,
                    (drift > -2.0 && drift < 2.0 && ticks == frames && irregular == 0) ? "OK" : "DRIFT");
             fflush(stdout); running = 0;
