@@ -20,6 +20,9 @@
 //   --sramcheck <srm> run the ROM's FF/FBE7 checksum over an SRAM image, per slot.
 #define SDL_MAIN_HANDLED
 #include "rom_verify.h"
+#include "switch_platform.h"
+#include "hoststats.h"
+#include "hostpool.h"
 #include "SDL.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -9210,6 +9213,15 @@ static void fieldWideAssemble(uint8_t* out, const uint8_t* wpic, const uint8_t* 
   }
 }
 extern int g_ctLogicalHoldApu;                   // snes/snes.c: the APU through a logical-frame hold
+// The mods menu on a controller: both sticks pressed (L3 + R3) -- the Switch's way to the F1 overlay. True on the press that
+// completes the chord (the other stick already held), so one chord is one toggle.
+static int fieldStickChord(const SDL_Event* e) {
+  if (e->type != SDL_CONTROLLERBUTTONDOWN || !g_pad) return 0;
+  int b = e->cbutton.button;
+  if (b != SDL_CONTROLLER_BUTTON_LEFTSTICK && b != SDL_CONTROLLER_BUTTON_RIGHTSTICK) return 0;
+  int other = b == SDL_CONTROLLER_BUTTON_LEFTSTICK ? SDL_CONTROLLER_BUTTON_RIGHTSTICK : SDL_CONTROLLER_BUTTON_LEFTSTICK;
+  return SDL_GameControllerGetButton(g_pad, (SDL_GameControllerButton)other) != 0;
+}
 // The F1 overlay, modal: draws the paused picture and the options until the player closes them; 1 = leave the game.
 static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
   if (dev) SDL_PauseAudioDevice(dev, 1);
@@ -9219,6 +9231,7 @@ static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) { quit = 1; open = 0; }
       else if (e.type == SDL_CONTROLLERDEVICEADDED) fieldPadOpen();
+      if (fieldStickChord(&e)) { open = 0; continue; }   // L3 + R3 again closes it
       if (CtOverlayProcessEvent(&e)) continue;       // a binding being captured, a widget typing
       if (e.type == SDL_KEYDOWN && !e.key.repeat && (e.key.keysym.sym == SDLK_F1 || e.key.keysym.sym == SDLK_ESCAPE)) open = 0;
       if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) open = 0;
@@ -9753,6 +9766,7 @@ int main(int argc, char** argv) {
                          gmem[0x61] == 2 ? "cart holds a save" : "blank cart");
   }
   CtAssets assets;
+  CtSwitchTrace("opening assets");
   if (!datpath || !CtAssetsOpen(&assets, datpath)) { printf("FAIL: cannot open assets '%s'\n", datpath ? datpath : "(none)"); return 2; }
   uint32_t fontLen = 0; const uint8_t* font = CtAssetGet(&assets, CT_ASSET_FONT, 0, &fontLen);
   if (font && fontLen < FONT_GLYPHS + FONT_GLYPHS * 48u) font = NULL;  // widths + 84 glyphs x 48B =
@@ -10654,6 +10668,7 @@ int main(int argc, char** argv) {
   // SDL_VIDEODRIVER=dummy and often no audio device at all), the ROM may be absent, and the $C7
   // upload may not complete. Any of those degrades to a silent-but-correct run -- audio must never
   // be able to fail a regression check or block the engine.
+  CtSwitchTrace("SDL_Init");
   if (SDL_Init(SDL_INIT_VIDEO) != 0) { printf("FAIL: SDL_Init: %s\n", SDL_GetError()); return 4; }
   // THE PLAYER'S OPTIONS (settings.h): read only by an interactive run -- a headless one (--selftest, CT_NOPACE, the
   // dummy video driver) keeps the defaults, so nothing a player saved can move a regression check.
@@ -10762,7 +10777,9 @@ int main(int argc, char** argv) {
     pc.fullscreen = st->fullscreen; pc.backend = st->backend; pc.sdlDriver = st->renderDriver; pc.vsync = st->vsync;
     pc.hidden = getenv("CT_OVERLAY_SHOT") != NULL;     // (the probe: no window on the player's screen)
   }
+  CtSwitchTrace("creating the window");
   CtPresenter* pr = CtPresentCreate(&pc);
+  CtSwitchTrace("window up");
   if (!pr) { printf("FAIL: no window: %s\n", SDL_GetError()); return 4; }
   SDL_Window* win = CtPresentWindow(pr);
   if (g_hostInteractive) {                             // the picture is placed by hostDstRect, the overlay on top
@@ -11145,7 +11162,7 @@ int main(int argc, char** argv) {
         if (g_pad && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pad)) == e.cdevice.which) {
           SDL_GameControllerClose(g_pad); g_pad = NULL; fieldPadOpen(); } }
       else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
-        if (e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE && CtOverlayAvailable()) { optionsReq = 1; continue; }
+        if ((e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE || fieldStickChord(&e)) && CtOverlayAvailable()) { optionsReq = 1; continue; }
         uint16_t pb = fieldPadButtonOf(e.cbutton.button);   // the same edges a key gives (below)
         if (pb & PAD_A) { talkPressed = 1; nmType = 1; }
         if (pb & PAD_UP) upPressed = 1;

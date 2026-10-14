@@ -234,6 +234,29 @@ def hash_sources(target):
 
 
 # ------------------------------------------------------------------------ main
+def build_posix(want):
+    """Linux/macOS: plain CMake (docs/INFRA.md), then the .exe-named links regress_checks.json expects."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    build = os.path.join(root, "build")
+    cmds = [["cmake", "-S", root, "-B", build, "-DCMAKE_BUILD_TYPE=RelWithDebInfo"],
+            ["cmake", "--build", build, "-j"] + (["--target", want] if want else [])]
+    for c in cmds:
+        if subprocess.run(c).returncode:
+            return 1
+    for t in ([want] if want else KNOWN_TARGETS):
+        exe = os.path.join(build, t)
+        if os.path.isfile(exe):
+            link = exe + ".exe"
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(t, link)
+        else:
+            print("MISSING artifact: " + exe)
+            if want:
+                return 1
+    return 0
+
+
 def main(argv):
     want = None
     args = [a for a in argv if a not in ("-h", "--help")]
@@ -246,6 +269,9 @@ def main(argv):
         want = args[0]
         if want not in KNOWN_TARGETS:
             fail("unknown target '{}' (know: {})".format(want, ", ".join(KNOWN_TARGETS)), 2)
+
+    if os.name != "nt":
+        return build_posix(want)
 
     targets = parse_cmakelists()
     byname = {t["name"]: t for t in targets}

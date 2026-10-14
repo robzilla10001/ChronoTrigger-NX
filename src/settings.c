@@ -41,7 +41,12 @@ void CtSettingsDefaults(CtSettings* s) {
     SDL_CONTROLLER_BUTTON_BACK, SDL_CONTROLLER_BUTTON_START };
   for (int b = 0; b < CT_BTN_COUNT; b++) s->pad[b] = p0[b];
   s->padStick = 1;
+#ifdef __SWITCH__
+  s->fullscreen = 1;                              // the console's screen: the whole of it, through SDL_Renderer
+#endif
   s->sync = CT_SYNC_FRAME_PERFECT;
+  s->statsHud = 0;
+  s->clocks = -1;
 }
 
 CtSettings* CtSettingsGet(void) {
@@ -84,6 +89,10 @@ static void setKey(CtSettings* s, const char* sec, const char* key, const char* 
     else if (!strcmp(key, "widescreen")) s->widescreen = !strcmp(val, "16:9") ? CT_WIDE_16_9 : !strcmp(val, "16:10") ? CT_WIDE_16_10 :
                                                          !strcmp(val, "21:9") ? CT_WIDE_21_9 : CT_WIDE_OFF;
     else if (!strcmp(key, "vsync")) s->vsync = iv != 0;
+    else if (!strcmp(key, "clocks")) s->clocks = !strcmp(val, "base") ? CT_CLK_BASE : !strcmp(val, "erista") ? CT_CLK_ERISTA :
+                                               !strcmp(val, "mariko") ? CT_CLK_MARIKO : !strcmp(val, "max") ? CT_CLK_MAX : -1;
+    else if (!strcmp(key, "stats_hud")) s->statsHud = !strcmp(val, "full") ? CT_HUD_FULL : !strcmp(val, "fps") ? CT_HUD_FPS :
+                                                       !strcmp(val, "off") ? CT_HUD_OFF : (iv != 0 ? CT_HUD_FULL : CT_HUD_OFF);   // (a number: the old on/off file = full)
     else if (!strcmp(key, "render_driver")) snprintf(s->renderDriver, sizeof s->renderDriver, "%s", val);
     else if (!strcmp(key, "backend")) s->backend = !strcmp(val, "opengl") ? 1 : !strcmp(val, "vulkan") ? 2 : 0;
   } else if (!strcmp(sec, "sound")) {
@@ -129,13 +138,14 @@ int CtSettingsSave(void) {
   FILE* f = fopen(CtSettingsPath(), "w");
   if (!f) return 0;
   fprintf(f, "; Chrono Trigger (native port) -- options. Edited by the F1 overlay; safe to edit by hand.\n\n");
-  fprintf(f, "[video]\nbackend=%s\nfullscreen=%d\nwindow_scale=%d\nscale=%s\naspect=%s\nfilter=%s\nwidescreen=%s\nwide_room_wrap=%d\nrender_scale=%d\ninterpolation=%d\nvsync=%d\nrender_driver=%s\n\n",
+  fprintf(f, "[video]\nbackend=%s\nfullscreen=%d\nwindow_scale=%d\nscale=%s\naspect=%s\nfilter=%s\nwidescreen=%s\nwide_room_wrap=%d\nrender_scale=%d\ninterpolation=%d\nvsync=%d\nrender_driver=%s\nstats_hud=%s\nclocks=%s\n\n",
           s->backend == 1 ? "opengl" : s->backend == 2 ? "vulkan" : "sdl", s->fullscreen, s->windowScale,
           s->scaleMode == CT_SCALE_INTEGER ? "integer" : s->scaleMode == CT_SCALE_STRETCH ? "stretch" : "fit",
           s->aspect == CT_ASPECT_4_3 ? "4:3" : "pixel", s->linearFilter ? "linear" : "nearest",
           s->widescreen == CT_WIDE_16_9 ? "16:9" : s->widescreen == CT_WIDE_16_10 ? "16:10" : s->widescreen == CT_WIDE_21_9 ? "21:9" : "off",
           s->wideRoomWrap, s->renderScale, s->interpolate, s->vsync,
-          s->renderDriver);
+          s->renderDriver, s->statsHud == CT_HUD_FULL ? "full" : s->statsHud == CT_HUD_FPS ? "fps" : "off",
+          s->clocks == CT_CLK_BASE ? "base" : s->clocks == CT_CLK_ERISTA ? "erista" : s->clocks == CT_CLK_MARIKO ? "mariko" : s->clocks == CT_CLK_MAX ? "max" : "auto");
   fprintf(f, "[sound]\nvolume=%d\nmute=%d\n\n", s->volume, s->mute);
   fprintf(f, "[controls]\npad_stick=%d\n", s->padStick);
   for (int b = 0; b < CT_BTN_COUNT; b++) {

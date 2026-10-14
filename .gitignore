@@ -108,3 +108,7 @@ tools/_*
 # agent worktrees + session scratch
 .claude/worktrees/
 /scratchpad/
+/build-switch/
+
+# Switch run logs (ct_log.txt, ct_stats.txt copied back from the console)
+/reports/

@@ -5307,6 +5307,9 @@ static void battleTrace(CtBattleHost* h, const char* ev) {
 // slice's 6 checks assert: $95DB (submenu boundary), $95DC (cursor), $9609/$960D (target-select+group), the
 // 7-byte resolver record $9EE3-9, $9877/$AE93 (anim selector/tech id), $A013 (freeze), current-seat curMP,
 // GATO curHP, the computed damage + span. Inert unless CT_BATTLE_TRACE is set (mirrors battleTrace/the coverage line).
+static int battleTechGroup(int techId);
+static int battleBuildHitSet(CtBattleHost* h, int group, int primary, int* out, int cap);
+
 static void battleTechTrace(CtBattleHost* h, const char* ev, int seat) {
   static int on = -1; if (on < 0) { const char* t = getenv("CT_BATTLE_TRACE"); on = (t && *t) ? 1 : 0; }
   if (!on) return;

@@ -26,6 +26,9 @@ enum {
 enum { CT_SCALE_FIT = 0, CT_SCALE_INTEGER = 1, CT_SCALE_STRETCH = 2 };
 enum { CT_ASPECT_PIXEL = 0, CT_ASPECT_4_3 = 1 };          // 256x224 square pixels (8:7) / a 4:3 television
 enum { CT_SYNC_FRAME_PERFECT = 0, CT_SYNC_FREE = 1 };
+enum { CT_HUD_OFF = 0, CT_HUD_FPS = 1, CT_HUD_FULL = 2 };
+// The Switch's clock profile (src/switch_platform.c: kProf): CPU / GPU / memory MHz. -1 = not chosen yet (the host picks by hardware).
+enum { CT_CLK_BASE = 0, CT_CLK_ERISTA = 1, CT_CLK_MARIKO = 2, CT_CLK_MAX = 3 };      // the stats HUD: nothing / the frame rate alone / every counter
 enum { CT_WIDE_OFF = 0, CT_WIDE_16_9 = 1, CT_WIDE_16_10 = 2, CT_WIDE_21_9 = 3 };
 
 typedef struct CtSettings {
@@ -51,6 +54,9 @@ typedef struct CtSettings {
   int padStick;                 // the left stick also drives the d-pad
   // how the game keeps the SNES's timing
   int sync;                     // CT_SYNC_*
+  // the host
+  int clocks;                   // CT_CLK_* (Switch only); -1 = pick by hardware at first run
+  int statsHud;                 // CT_HUD_*: the performance counters over the picture (hoststats.h); off by default
 } CtSettings;
 
 CtSettings* CtSettingsGet(void);                 // the live options (defaults until CtSettingsLoad)

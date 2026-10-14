@@ -5,7 +5,9 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
+#ifndef CT_NO_GL                                           // (the Switch build: SDL_Renderer only, no ImGui GL loader)
 #include "backends/imgui_impl_opengl3.h"
+#endif
 #ifdef CT_HAVE_VULKAN
 #include "backends/imgui_impl_vulkan.h"
 #include "present_vk.h"
@@ -46,6 +48,9 @@ extern "C" int CtOverlayInit(CtPresenter* pr) {
   // fullscreen, 1x in the default 512x448 window.
   { int ow = 0, oh = 0; CtPresentOutputSize(pr, &ow, &oh);
     int k = (oh + 270) / 540; if (k < 1) k = 1; if (k > 4) k = 4;
+#ifdef __SWITCH__
+    if (k < 2) k = 2;                                      // a 720p handheld screen read from arm's length: 13 px is too small
+#endif
     ImFontConfig fc; fc.SizePixels = 13.0f * (float)k; io.Fonts->AddFontDefault(&fc);
     ImGui::GetStyle().ScaleAllSizes((float)k); }
   ImGui::StyleColorsDark();
@@ -63,8 +68,13 @@ extern "C" int CtOverlayInit(CtPresenter* pr) {
     ok = ImGui_ImplSDL2_InitForVulkan(win) && ImGui_ImplVulkan_LoadFunctions(vkLoader, vk) && ImGui_ImplVulkan_Init(&ii);
   } else
 #endif
+#ifndef CT_NO_GL
   ok = glc ? (ImGui_ImplSDL2_InitForOpenGL(win, glc) && ImGui_ImplOpenGL3_Init("#version 330 core"))
            : (ImGui_ImplSDL2_InitForSDLRenderer(win, ren) && ImGui_ImplSDLRenderer2_Init(ren));
+#else
+  glc = NULL;
+  ok = ImGui_ImplSDL2_InitForSDLRenderer(win, ren) && ImGui_ImplSDLRenderer2_Init(ren);
+#endif
   if (!ok) { ImGui::DestroyContext(); return 0; }
   g_ren = ren; g_gl = glc != NULL; g_vk = vk; g_ok = 1;
   return 1;
@@ -75,7 +85,10 @@ extern "C" void CtOverlayShutdown(void) {
 #ifdef CT_HAVE_VULKAN
   if (g_vk) ImGui_ImplVulkan_Shutdown(); else
 #endif
-  if (g_gl) ImGui_ImplOpenGL3_Shutdown(); else ImGui_ImplSDLRenderer2_Shutdown();
+#ifndef CT_NO_GL
+  if (g_gl) ImGui_ImplOpenGL3_Shutdown(); else
+#endif
+  ImGui_ImplSDLRenderer2_Shutdown();
   ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext();
   g_ok = 0;
 }
@@ -137,7 +150,10 @@ extern "C" int CtOverlayFrame(void) {
 #ifdef CT_HAVE_VULKAN
   if (g_vk) ImGui_ImplVulkan_NewFrame(); else
 #endif
-  if (g_gl) ImGui_ImplOpenGL3_NewFrame(); else ImGui_ImplSDLRenderer2_NewFrame();
+#ifndef CT_NO_GL
+  if (g_gl) ImGui_ImplOpenGL3_NewFrame(); else
+#endif
+  ImGui_ImplSDLRenderer2_NewFrame();
   ImGui_ImplSDL2_NewFrame();
   ImGui::NewFrame();
   const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -147,7 +163,7 @@ extern "C" int CtOverlayFrame(void) {
                           ImGuiCond_Always, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(size, ImGuiCond_Always);
   bool open = true;
-  ImGui::Begin("Options  (F1 / Esc closes)", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+  ImGui::Begin("Options  (F1 / Esc / L3+R3 closes)", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                ImGuiWindowFlags_NoCollapse);
   if (!open) ch |= CT_OVL_CLOSE;
   if (ImGui::BeginTabBar("tabs")) {
@@ -188,7 +204,35 @@ extern "C" int CtOverlayFrame(void) {
       bool vs = s->vsync != 0;
       if (ImGui::Checkbox("VSync", &vs)) { s->vsync = vs; ch |= CT_OVL_VIDEO; }
       if (!s->fullscreen && ImGui::SliderInt("Window size", &s->windowScale, 1, 8, "%dx")) ch |= CT_OVL_VIDEO;
+#if defined(__SWITCH__) || defined(CT_CLK_PREVIEW)      // (CT_CLK_PREVIEW: draw it on a PC build, to look at the layout)
+      { // THE SWITCH'S CLOCKS: CPU / GPU / memory, applied live by the host (switch_platform.c) and re-asserted while the game runs.
+        const char* clk[] = { "Base (safe, stock)", "Erista boost", "Mariko boost", "Max performance" };
+        int cs = s->clocks < 0 ? CT_CLK_ERISTA : s->clocks > 3 ? 3 : s->clocks;
+        if (ImGui::Combo("Clocks", &cs, clk, 4)) s->clocks = cs;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Base (safe, stock): CPU 1020 MHz, GPU 460 MHz, memory 1331 MHz. Limited to 1x resolution.\n"
+                            "Erista boost: GPU 618 MHz, memory 1600 MHz (CPU 1785). 2-4x resolution; generally regarded as safe levels.\n"
+                            "Mariko boost: GPU 768 MHz, memory 1600 MHz (CPU 1785). 2-4x resolution; generally regarded as safe levels.\n"
+                            "Max performance: CPU 1963 MHz, GPU 921 MHz, memory 1600 MHz. May degrade battery life; a comfortable\n"
+                            "cushion for performance stability.\n"
+                            "Takes effect at once. The Erista / Mariko choice follows the console's hardware by default.");
+        ImGui::TextDisabled("%s", cs == CT_CLK_BASE ? "Safe, stock clocks: use 1x resolution." :
+                                  cs == CT_CLK_MAX ? "May degrade battery life; the most headroom." : "Generally regarded as safe: 2-4x resolution.");
+      }
+#endif
+      const char* huds[] = { "Full HUD", "FPS only", "OFF" };          // (listed top to bottom; the setting counts the other way)
+      int hudSel = 2 - (s->statsHud < 0 ? 0 : s->statsHud > 2 ? 2 : s->statsHud);
+      if (ImGui::Combo("Performance HUD", &hudSel, huds, 3)) s->statsHud = 2 - hudSel;
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Full HUD: the host's counters over the picture -- engine and shown frames per second, the time a frame\n"
+                          "takes and where it goes (audio, picture, title, upload, swap), late frames, the audio queue, the\n"
+                          "picture's rendered and shown sizes and, on the Switch, the CPU clock.\n"
+                          "FPS only: just the frame rate.  OFF: nothing drawn.\n"
+                          "It only reads clocks; it changes nothing in the game.");
       ImGui::Separator();
+#ifdef CT_NO_GL
+      ImGui::TextDisabled("Video backend: SDL_Renderer (the only one in this build).");
+#else
       const char* bk[] = { "SDL (Direct3D / automatic)", "OpenGL 3.3", "Vulkan" };
       if (ImGui::Combo("Video backend", &s->backend, bk, 3)) ch |= CT_OVL_RESTART;
       if (s->backend == CT_BACKEND_SDL) {
@@ -201,8 +245,11 @@ extern "C" int CtOverlayFrame(void) {
           ch |= CT_OVL_RESTART;
         }
       }
+#endif
       ImGui::TextDisabled("In use: %s", g_backendName);
+#ifndef CT_NO_GL
       ImGui::TextDisabled("The backend and the driver take effect the next time the game starts.");
+#endif
       ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Audio", NULL, g_selTab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
@@ -267,6 +314,8 @@ extern "C" void CtOverlayRender(void) {
   if (g_vk) { VkCommandBuffer c = (VkCommandBuffer)CtVkCommandBuffer(g_vk);
              if (c) ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), c); return; }
 #endif
-  if (g_gl) ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-  else ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), g_ren);
+#ifndef CT_NO_GL
+  if (g_gl) ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData()); else
+#endif
+  ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), g_ren);
 }
