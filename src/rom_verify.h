@@ -1,6 +1,6 @@
 // rom_verify.h -- the one ROM this project runs: Chrono Trigger (USA), the No-Intro dump.
 //
-// BelthasarProject ships none of the game. Every program that reads a ROM checks it here first, so the code only ever runs
+// ChronoTrigger-NX ships none of the game. Every program that reads a ROM checks it here first, so the code only ever runs
 // the cartridge its user dumped (docs/ROM.md). A 512-byte copier header is accepted and skipped.
 #pragma once
 #include <stdint.h>

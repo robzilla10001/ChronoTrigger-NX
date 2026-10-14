@@ -1,6 +1,6 @@
 # Testing overview
 
-A short guide to how BelthasarProject is tested. The detailed reference (every flag, the pinning rules, per-check notes)
+A short guide to how ChronoTrigger-NX is tested. The detailed reference (every flag, the pinning rules, per-check notes)
 is [TESTING.md](TESTING.md). How a behaviour gets a check in the first place is in
 [METHODOLOGY.md](METHODOLOGY.md#5-from-a-report-to-a-pinned-check).
 

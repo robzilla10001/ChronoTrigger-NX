@@ -1,6 +1,6 @@
 # The ROM
 
-BelthasarProject ships no part of Chrono Trigger. It needs a copy of the game that you own, and it runs only on one
+ChronoTrigger-NX ships no part of Chrono Trigger. It needs a copy of the game that you own, and it runs only on one
 specific dump of it.
 
 ## The supported ROM
@@ -47,13 +47,13 @@ In short:
    `de5822f4f2f7a55acb8926d4c0eaa63d5d989312`; if yours does not, reseat and clean the cartridge and dump again.
 5. Run `python tools/setup.py --rom Chrono_Trigger_USA_SNES.sfc` ([README.md](../README.md#2-set-up-from-your-rom)).
 
-The battery save can be dumped the same way, but BelthasarProject does not need it.
+The battery save can be dumped the same way, but ChronoTrigger-NX does not need it.
 
 Downloading a ROM you do not own is not a substitute, and the project will not help you find one.
 
 ## Verifying the dump
 
-BelthasarProject verifies the dump itself, but you can check it before you start:
+ChronoTrigger-NX verifies the dump itself, but you can check it before you start:
 
 ```sh
 # Windows (PowerShell)
@@ -63,7 +63,7 @@ Get-FileHash -Algorithm SHA1 .\Chrono_Trigger_USA_SNES.sfc
 sha1sum Chrono_Trigger_USA_SNES.sfc
 ```
 
-If the file is 4,194,816 bytes, it has a copier header and the plain file hash will not match. BelthasarProject strips the
+If the file is 4,194,816 bytes, it has a copier header and the plain file hash will not match. ChronoTrigger-NX strips the
 header for you. To check by hand, hash the file without its first 512 bytes
 (`tail -c +513 file.sfc | sha1sum`).
 

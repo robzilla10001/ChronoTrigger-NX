@@ -1,6 +1,6 @@
 # Decision log
 
-The decisions that shaped BelthasarProject, newest first. Each entry gives the date, the decision, why it was taken, its
+The decisions that shaped ChronoTrigger-NX, newest first. Each entry gives the date, the decision, why it was taken, its
 consequences, and where it lives. "The owner" is the project's owner. Most of the code was written by coding agents
 under the owner's direction, and an entry says when a choice was the owner's, when the owner delegated it, and when
 it was derived from measurement. The owner's words are quoted in English translation.

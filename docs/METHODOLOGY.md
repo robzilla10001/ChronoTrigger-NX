@@ -1,6 +1,6 @@
 # Methodology
 
-How BelthasarProject decides what the game does, how it checks that the C engine does the same, and the rules that keep
+How ChronoTrigger-NX decides what the game does, how it checks that the C engine does the same, and the rules that keep
 both honest. The model is [snesrev/zelda3](https://github.com/snesrev/zelda3): a C re-implementation checked frame by
 frame against the original program running in an embedded emulator.
 
@@ -105,7 +105,7 @@ zelda3 solved this by changing **both sides**: its harness replaces the beam-cou
 deterministic value and runs exactly one main-loop iteration plus its NMI per frame, so no lag frame exists. The C
 code then has to match that oracle exactly.
 
-BelthasarProject adopted the same approach (decided 2026-09-18, extended through 2026-10-09). The oracle runs in
+ChronoTrigger-NX adopted the same approach (decided 2026-09-18, extended through 2026-10-09). The oracle runs in
 **logical-frame mode** (`CT_ORACLE_LOGICAL=1`), and the engine matches it. Together these are called **the rule**.
 
 ### What the rule does

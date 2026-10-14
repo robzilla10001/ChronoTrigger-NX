@@ -1,11 +1,11 @@
 # Credits
 
-BelthasarProject stands on other people's work. This file names it, says what each piece is used for, and gives its license.
+ChronoTrigger-NX stands on other people's work. This file names it, says what each piece is used for, and gives its license.
 
 ## The game
 
 **Chrono Trigger** (SNES, 1995) is by Square Co., Ltd., now Square Enix. Every byte of the game belongs to them.
-BelthasarProject contains none of it: the build reads the program and data from a copy of the cartridge that you own
+ChronoTrigger-NX contains none of it: the build reads the program and data from a copy of the cartridge that you own
 (see [docs/ROM.md](docs/ROM.md)). "Chrono Trigger" is a trademark of Square Enix; this project is not affiliated with
 or endorsed by Square Enix or Nintendo.
 

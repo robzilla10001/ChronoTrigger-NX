@@ -1,6 +1,6 @@
 # Architecture
 
-This page describes how BelthasarProject is put together: the programs, the source files, how data flows from your ROM
+This page describes how ChronoTrigger-NX is put together: the programs, the source files, how data flows from your ROM
 into the engine, and how each subsystem is organised. For the build itself see [INFRA.md](INFRA.md). For how
 behaviour is derived and checked see [METHODOLOGY.md](METHODOLOGY.md).
 

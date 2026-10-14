@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Export the public tree of BelthasarProject: the tracked files minus everything that comes from the game, scanned.
+r"""Export the public tree of ChronoTrigger-NX: the tracked files minus everything that comes from the game, scanned.
 
     python tools/release/export_public.py --out <dir> [--rom ROM] [--commit]
 
@@ -96,7 +96,7 @@ def main():
         if ignored:                                   # the public .gitignore would silently drop a file the tree uses
             print('export: the exported .gitignore ignores %d exported file(s): %s' % (len(ignored), ', '.join(ignored)))
             return 1
-        msg = ('BelthasarProject: initial public tree\n\n'
+        msg = ('ChronoTrigger-NX: initial public tree\n\n'
                'A native C re-implementation of Chrono Trigger (SNES, USA), checked against the original running in an\n'
                'embedded SNES core. No part of the game is included: python tools/setup.py --rom <your dump> generates\n'
                'everything that comes from it. See README.md and docs/.\n\n'

@@ -31,5 +31,5 @@ set_source_files_properties(${ROOT}/src/overlay.cpp ${IMGUI}/imgui.cpp ${IMGUI}/
 target_include_directories(ct_field PRIVATE ${ROOT}/src ${ROOT}/snes ${DEVKITPRO}/portlibs/switch/include/SDL2)
 target_compile_options(ct_field PRIVATE -O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 -fno-strict-aliasing -w)
 target_link_libraries(ct_field PRIVATE SDL2 EGL glapi drm_nouveau stdc++ m)
-nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C)" AUTHOR "Belthasar Project" VERSION "0.1")
+nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C)" AUTHOR "ChronoTrigger-NX" VERSION "0.1")
 nx_create_nro(ct_field NACP ct_field.nacp)

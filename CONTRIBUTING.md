@@ -1,6 +1,6 @@
-# Contributing to BelthasarProject
+# Contributing to ChronoTrigger-NX
 
-Thank you for helping. BelthasarProject has a few firm rules, because a port that is faithful only by accident is no port
+Thank you for helping. ChronoTrigger-NX has a few firm rules, because a port that is faithful only by accident is no port
 at all. Read this page before your first change. [docs/METHODOLOGY.md](docs/METHODOLOGY.md) explains the reasons
 behind the rules.
 
@@ -92,7 +92,7 @@ run the full suite. Any cached oracle output, including your own tools' caches, 
 
 ## Reporting a divergence
 
-A divergence is any place where BelthasarProject does something the cartridge does not: a wrong picture, a frame of timing
+A divergence is any place where ChronoTrigger-NX does something the cartridge does not: a wrong picture, a frame of timing
 that changes what happens, a script that stalls, wrong numbers in a fight.
 
 Include:
