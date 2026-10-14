@@ -15903,8 +15903,11 @@ static void battleShadowStage(uint8_t* m) {
   m[0xBE99] = m[0x2C6E]; m[0xBE9A] = m[0x2C6F]; m[0xBE93] = m[0x2C6C]; m[0xBE94] = m[0x2C6D];
   m[0xBE93] = 0xE0; m[0xC866] = 0xE0; m[0xBB00] = 0x0F;              // CD/0D1A-0D24
 }
+void (*CtBattleLapHook)(int stage) = NULL;
+#define BT_LAP(n) do { if (CtBattleLapHook) CtBattleLapHook(n); } while (0)
 void CtBattleBegin(CtBattleHost* h) {
   if (!h || !h->mem || !h->glb) return;
+  BT_LAP(0);
   // D1/F210-F29E, the module's HDMA/window init at the field-to-battle transition (oracle gato_t0 f78, writers
   // D1:F22D/F24B/F28A, 60 frames before the wipe): a pre-battle seed carries the field's leftovers in the bytes the
   // system-message box now reads ($CD05 = $37, $CD06 = $AF on gato_t0.raw.wram -- a box tick fired at boot). The
@@ -16005,6 +16008,7 @@ void CtBattleBegin(CtBattleHost* h) {
   // -- the port started at the third pair and left $BC87 = 0D and $BE89/$BE8A = 25 EE, the seed's bytes.
   battleShadowStage(h->mem);
   battleBootWipe(h);                                               // CF/FB92 -- before the loaders (stageAll)
+  BT_LAP(1);                                                       // (the prelude and the boot wipe)
   // (JSL FD/B223, the $AE6D identity, is C1/FDA5's -- battleCombatStart, after FD/A982's clear in stageAll. It stood
   //  here, ahead of that clear, and the table read all zeros through the whole fight.)
   // CF/FBB8-FBE1, between the wipe and the loaders' `JML C1/8000`, byte for byte:
@@ -16024,6 +16028,7 @@ void CtBattleBegin(CtBattleHost* h) {
       s[0xA0A7] = (uint8_t)((g7f[0xBA] & 0x02) ^ 0x02);
     } }
   stageAll(h);
+  BT_LAP(2);                                                       // (the loaders: stageAll)
   for (int c = 0; c < 11; c++) { h->mem[0xA441 + c] = 0xFF; h->mem[0xA44C + c] = 0xFF; }   // CC/E360-E36D: LDA #FF, all eleven
   // $96F5,X -- the PRESENT flags the ROM tests everywhere (C1/34AF, C1/2E09, C1/308E, C1/35EB ...): the loader's
   // CC/E63D `INC $96F5,X` per staged combatant (oracle gato_t0 `01 01 00 00 00 00 01 ..` = seats 0/1 + cmb 6). The
@@ -16128,6 +16133,7 @@ void CtBattleBegin(CtBattleHost* h) {
   // C1/FB5D + CC/E755: every seat's tech records (singles, duals, the triple) and the display lists, ONCE at the
   // boot, after stageAll's $AEFF / $B1BE / $B3BA (disasm/notes/battle_dual_triple_techs.md sec. 1-2).
   battleTechBootRecords(h);
+  BT_LAP(3);                                                       // (the item list, the tech records)
   // The top box's boot bytes (battle_top_message_box.md sec. 2.1/2.3): `$A0DB := $2990 & 80` (CC/E3AC-E3B1, the
   // "Skill/Item Info." option), $9F34 = the seats wearing a SightScope (A4) or a Relic (B8) (CC/F034-F055, after FD/B0F8's
   // STZ), and $9F29,Y for an enemy = `(block +0x1A & 02) ^ 02` (FD/B0FB-B10C).
@@ -16331,7 +16337,9 @@ void CtBattleBegin(CtBattleHost* h) {
   for (int x = 0; x <= 6; x++) s[0x9919 + x] = 0xFF;
   s[0xA112] = 0x08;                                                 // CC/E378-E37A: the low-HP blink's first period (CF/E58A)
   s[0xCE0F] = 0;                                                    // D1/F26E `STZ $CE0F` (CD/088D's gate on the strip upload)
+  BT_LAP(4);                                                        // (the rest of the boot state)
   battleStripBoot(h);                                               // C1/0023-0027 + the boot NMI's CC/E0AF / CC/E1B0
+  BT_LAP(5);                                                        // (the strip boot)
 }
 
 // ONE module frame. The battle plays ON the live field scene (oracle-proven, battle_entry.md §1).

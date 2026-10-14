@@ -569,6 +569,27 @@ static int uploadDriver(CtAudio* a, const uint8_t* rom, long romLen) {
 #define C7_SFXSET_B  0x75B0Bu   // driver mode 1 (battle) -- the block the IPL never uploads
 #define C7_IPL_BLK2  0x740B4u   // block 2's [u16 len]; its ARAM destination is $4700
 
+
+// ---- the handshake entry points, timed (see audio.h) ----
+double (*CtAudioClockHook)(void) = NULL;
+static double g_audHeavyAcc;
+double CtAudioHeavyTakeMs(void) { double r = g_audHeavyAcc; g_audHeavyAcc = 0; return r; }
+static int audioServiceImpl(CtAudio* a, uint8_t* mem7E);
+static int audioColdBootImpl(CtAudio* a, long long* master, int* frames);
+static int audioWaitReplyImpl(CtAudio* a, int* frames);
+int CtAudioService(CtAudio* a, uint8_t* mem7E) {
+  double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioServiceImpl(a, mem7E);
+  if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
+}
+int CtAudioColdBoot(CtAudio* a, long long* master, int* frames) {
+  double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioColdBootImpl(a, master, frames);
+  if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
+}
+int CtAudioWaitReplyNibble(CtAudio* a, int* frames) {
+  double t0 = CtAudioClockHook ? CtAudioClockHook() : 0.0; int r = audioWaitReplyImpl(a, frames);
+  if (CtAudioClockHook) g_audHeavyAcc += CtAudioClockHook() - t0; return r;
+}
+
 int CtAudioSongCount(const CtAudio* a) {
   if (!a || !a->rom || (long)C7_SONGCOUNT >= a->romLen) return 0;
   return a->rom[C7_SONGCOUNT];
@@ -1308,7 +1329,7 @@ int CtAudioLoadSong(CtAudio* a, uint8_t* m, int songId, uint8_t cmd) {
 // byte. Same protocol as uploadDriver, run on the loader clock with the listing's own instructions, on the RESET
 // background (no NMI, no HDMA: FD:C000's `$4200 = 0`). The master cycles it returns are CPU time the reset spends
 // before C0/0057 -- the host holds the screen black for them.
-int CtAudioColdBoot(CtAudio* a, long long* master, int* frames) {
+static int audioColdBootImpl(CtAudio* a, long long* master, int* frames) {
   if (master) *master = 0; if (frames) *frames = 0;
   if (!a || !a->rom) return 0;
   ldStart(2, 0);
@@ -1500,7 +1521,7 @@ int CtAudioPost(CtAudio* a, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3) {
   return 1;
 }
 
-int CtAudioService(CtAudio* a, uint8_t* mem7E) {
+static int audioServiceImpl(CtAudio* a, uint8_t* mem7E) {
   if (!a || !mem7E) return 0;      // NULL mem7E = no scene VM (overworld); nothing stages commands there
   uint8_t* mb = mem7E + 0x1E00;                        // $00:1E00 mirrors $7E:1E00
   int rc;
@@ -1576,7 +1597,7 @@ int CtAudioService(CtAudio* a, uint8_t* mem7E) {
 // than baked -- the caller loses them the way the ROM's CPU does.
 // ⚠ The ROM's loop is UNBOUNDED (it hangs forever if the driver never answers). This one stops at
 // SPIN_LIMIT and reports 0, because a host that hangs is worse than one that says it gave up.
-int CtAudioWaitReplyNibble(CtAudio* a, int* frames) {
+static int audioWaitReplyImpl(CtAudio* a, int* frames) {
   if (frames) *frames = 0;
   if (!a || !a->ready) return 0;
   ldStart(a->engineMode, a->postLine);

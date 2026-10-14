@@ -4,6 +4,12 @@
 
 #include <stdint.h>
 #include "assets.h"
+// The host's thread pool for the bake (hostpool.h); NULL = serial. Installed once by ct_field.
+// THE WINDOWED BAKE (scene.c): update the baked picture in place, only around the camera. See CtFieldSceneSetBakeWindow's comment.
+void CtFieldSceneSetBakeWindow(void* h, int vx0, int vy0, int vx1, int vy1, int m1, int m2, unsigned char* out, unsigned char* prio, int W, int H);
+int  CtFieldSceneBakeCovers(void* h);
+int  CtFieldSceneBakeWindowPieces(void* h, int out[4][4]);       // the last bake's pieces (up to 4 rectangles x0 y0 x1 y1); returns how many
+void CtSceneSetParallel(void (*parFor)(int n, int grain, void (*fn)(void*, int, int), void* ctx));
 
 // Render scene `index` (animation `frame`) to a freshly malloc'd RGB buffer
 // (3 bytes/pixel). `blend` enables SNES color-math; `full` disables the

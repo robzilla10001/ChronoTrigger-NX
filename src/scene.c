@@ -233,7 +233,7 @@ static int build_pal_anim_desc(const uint8_t* rom, int index, uint8_t* out) {
 static void draw_layer(uint8_t* px, uint8_t* cov, int W, int H, const uint16_t* tiles, int lw, int lh,
                        const Meta* metas, int nmeta, const uint8_t* chips, const uint8_t* present,
                        int nchips, uint8_t pal[128][3], int prio, uint8_t bit, uint8_t* priomask,
-                       const uint8_t* tprio, int tpw, int tph, int sox, int soy, int mapRing) {
+                       const uint8_t* tprio, int tpw, int tph, int sox, int soy, int mapRing, int rowA, int rowB, int colA, int colB) {
   if (!tiles || !metas || !chips) return;
   // SNES BG layers wrap: a layer smaller than the canvas tiles to fill it
   // (chip_x % width, chip_y % height in CTViewer). Iterate the whole canvas in
@@ -254,8 +254,15 @@ static void draw_layer(uint8_t* px, uint8_t* cov, int W, int H, const uint16_t* 
   if (mapRing) { LW = (lw != 16 || lh != 16) ? 512 : 256; LH = 256; }
   int ox = ((sox % LW) + LW) % LW, oy = ((soy % LH) + LH) % LH;
   int mx0 = ox / 16, my0 = oy / 16, fx0 = ox % 16, fy0 = oy % 16;
-  for (int cy = 0; cy <= chm; cy++)
-    for (int cx = 0; cx <= cwm; cx++) {
+  // A BAND is the canvas rows [rowA, rowB) (0 <= rowA <= rowB <= H): only those pixel rows are written, so bands never touch the
+  // same pixel and may be drawn on other threads; within a band every pass keeps its order, so each pixel gets the same layers in
+  // the same order as a whole-canvas draw. (Cell rows are NOT a safe band: a layer's scroll offset shifts its cells by fy0 rows.)
+  int cyLo = (rowA + fy0) / 16 - 1; if (cyLo < 0) cyLo = 0;
+  int cyHi = (rowB + fy0) / 16 + 1; if (cyHi > chm) cyHi = chm;
+  int cxLo = (colA + fx0) / 16 - 1; if (cxLo < 0) cxLo = 0;       // (the same for the columns: a window is a rectangle of pixels)
+  int cxHi = (colB + fx0) / 16 + 1; if (cxHi > cwm) cxHi = cwm;
+  for (int cy = cyLo; cy <= cyHi; cy++)
+    for (int cx = cxLo; cx <= cxHi; cx++) {
       if (cy * 16 - fy0 >= H || cx * 16 - fx0 >= W) continue;
       int ti;
       if (!mapRing) ti = tiles[((cy + my0) % lh) * lw + ((cx + mx0) % lw)];
@@ -277,13 +284,13 @@ static void draw_layer(uint8_t* px, uint8_t* cov, int W, int H, const uint16_t* 
         const uint8_t* tile = chips + (size_t)c->chip * 64;
         int kox = (k % 2) * 8, koy = (k / 2) * 8;
         for (int y = 0; y < 8; y++) {
-          int py = cy * 16 - fy0 + koy + y; if (py >= H) break;
-          if (py < 0) continue;
+          int py = cy * 16 - fy0 + koy + y; if (py >= rowB) break;
+          if (py < rowA) continue;
           for (int x = 0; x < 8; x++) {
             uint8_t v = tile[(c->fy ? 7 - y : y) * 8 + (c->fx ? 7 - x : x)];
             if (v == 0) continue;
-            int pxx = cx * 16 - fx0 + kox + x; if (pxx >= W) break;
-            if (pxx < 0) continue;
+            int pxx = cx * 16 - fx0 + kox + x; if (pxx >= colB) break;
+            if (pxx < colA) continue;
             int idx = py * W + pxx;
             memcpy(px + (size_t)idx * 3, pal[c->base + v], 3);
             cov[idx] = bit;
@@ -301,7 +308,7 @@ typedef struct { const uint16_t* tiles; int lw, lh; const Meta* metas; int nmeta
                  const uint8_t* tprio; int tpw, tph; int sox, soy; int mapRing; } LInfo;
 
 static void draw_pass(uint8_t* px, uint8_t* cov, int W, int H, int targets, uint8_t pal[128][3],
-                      LInfo* l1, LInfo* l2, LInfo* l3, uint8_t* priomask) {
+                      LInfo* l1, LInfo* l2, LInfo* l3, uint8_t* priomask, int rowA, int rowB, int colA, int colB) {
   int order_bit[6] = { BL3, BL2, BL1, BL2, BL1, BL3 };
   int order_prio[6] = { 0, 0, 0, 1, 1, 1 };
   LInfo* order_l[6] = { l3, l2, l1, l2, l1, l3 };
@@ -310,7 +317,60 @@ static void draw_pass(uint8_t* px, uint8_t* cov, int W, int H, int targets, uint
     LInfo* L = order_l[i];
     draw_layer(px, cov, W, H, L->tiles, L->lw, L->lh, L->metas, L->nmeta,
                L->chips, L->present, L->nchips, pal, order_prio[i], (uint8_t)order_bit[i], priomask,
-               L->tprio, L->tpw, L->tph, L->sox, L->soy, L->mapRing);
+               L->tprio, L->tpw, L->tph, L->sox, L->soy, L->mapRing, rowA, rowB, colA, colB);
+  }
+}
+
+// THE BAKE ON THE HOST'S POOL (hostpool.h, installed by ct_field through CtSceneSetParallel; without it the bands run in
+// order on the caller, as the bake always did). A band is a run of 16-pixel cell rows: the cells of different rows write
+// different pixel rows, and within a band the passes keep their order, so the picture is the same pixels.
+static void (*g_sceneParFor)(int n, int grain, void (*fn)(void*, int, int), void* ctx);
+void CtSceneSetParallel(void (*parFor)(int, int, void (*)(void*, int, int), void*)) { g_sceneParFor = parFor; }
+typedef struct { uint8_t *main_px, *main_cov, *sub_px, *sub_cov; int W, H, main_t, sub_t; uint8_t (*pal)[3];
+                 LInfo *l1, *l2, *l3; uint8_t* priomask;
+                 int blend_en, sub_op, half; uint8_t *pre, *mot;
+                 int row0, x0, x1; } BakeJob;             // (the rectangle: rows row0 + [a, b), columns [x0, x1) -- the whole canvas for a full bake)
+// One band of the bake, all of it: clear its pixels, draw the layers, keep the pre-math copy, do the colour math and the
+// backdrop, and note the motion coverage. Every step reads and writes only the band's own pixels.
+static void bakeBand(void* ctx, int a, int b) {
+  BakeJob* j = (BakeJob*)ctx;
+  const int W = j->W, rowA = j->row0 + a, rowB = j->row0 + b, x0 = j->x0, x1 = j->x1;
+  const size_t cw = (size_t)(x1 - x0);
+  for (int y = rowA; y < rowB; y++) {
+    size_t p0 = (size_t)y * W + x0;
+    memset(j->main_px + p0 * 3, 0, cw * 3); memset(j->main_cov + p0, 0, cw);
+    memset(j->sub_px + p0 * 3, 0, cw * 3);  memset(j->sub_cov + p0, 0, cw);
+    if (j->priomask) memset(j->priomask + p0, 0, cw);
+  }
+  draw_pass(j->main_px, j->main_cov, W, j->H, j->main_t, j->pal, j->l1, j->l2, j->l3, j->priomask, rowA, rowB, x0, x1);
+  draw_pass(j->sub_px, j->sub_cov, W, j->H, j->sub_t, j->pal, j->l1, j->l2, j->l3, j->priomask, rowA, rowB, x0, x1);
+  uint8_t *main_px = j->main_px, *main_cov = j->main_cov, *sub_px = j->sub_px, *sub_cov = j->sub_cov;
+  int sub_t = j->sub_t, blend_en = j->blend_en, sub_op = j->sub_op, half = j->half;
+  for (int y = rowA; y < rowB; y++) {
+    size_t i0 = (size_t)y * W + x0, i1 = i0 + cw;
+    if (j->pre) memcpy(j->pre + i0 * 3, main_px + i0 * 3, cw * 3);           // the main screen as it stands before the math
+    if (sub_t) {
+      static const uint8_t BLACK[3] = { 0, 0, 0 };
+      for (size_t i = i0; i < i1; i++) {
+        size_t o = i * 3; int mc = main_cov[i], sc = sub_cov[i];
+        const uint8_t* inp = sc ? (sub_px + o) : BLACK;
+        if ((mc & blend_en) && sc) {
+          for (int k = 0; k < 3; k++) {
+            int d = main_px[o + k] >> 3, s2 = inp[k] >> 3;
+            int r = sub_op ? d - s2 : d + s2;
+            if (half) r >>= 1;
+            if (r < 0) r = 0; if (r > 31) r = 31;
+            main_px[o + k] = (uint8_t)((r << 3) | (r >> 2));
+          }
+        } else if (mc == 0 && sc) {
+          memcpy(main_px + o, inp, 3);
+        }
+      }
+    }
+    for (size_t i = i0; i < i1; i++)                                         // the backdrop (CGRAM 0) where nothing covers
+      if (!main_cov[i] && !(sub_t && sub_cov[i])) memcpy(main_px + i * 3, j->pal[0], 3);
+    if (j->mot)
+      for (size_t i = i0; i < i1; i++) j->mot[i] = main_cov[i] ? main_cov[i] : (sub_t && sub_cov[i]) ? sub_cov[i] : 0;
   }
 }
 
@@ -351,6 +411,13 @@ typedef struct {
   uint8_t* layRgb[6]; uint8_t* layCov[6]; int layW[6], layH[6], layDirty;   // CtFieldSceneLayers, built on demand
   int bakedO[4];                           // the layer offsets the last bake drew at (l2ox l2oy l3ox l3oy then)
   uint8_t* bakeMotCov;                     // ...and the layer the pixel's picture comes from: the main screen's, else the
+  // THE WINDOWED BAKE (CtFieldSceneSetBakeWindow): the host says which pixel rectangle it reads; a bake then recomputes only that region, IN PLACE.
+  // The five arrays below are persistent and sd-owned (bakeCov / bakeMotCov / bakeMain alias three of them while windowed); the picture and the
+  // priority mask stay the host's (it hands their pointers in). pwHave* = what the destination holds for the CURRENT state: the whole map after a
+  // full bake, the last bake's rectangle after a windowed one.
+  uint8_t *pwCov, *pwMot, *pwPre, *pwSubPx, *pwSubCov; int pwW, pwH;
+  int pwOn, pwNeedN, pwNeedR[4][4], pwBakeN, pwBakeR[4][4]; uint8_t *pwReqOut, *pwReqPrio; int pwReqW, pwReqH;    // (a rectangle that crosses a canvas edge is up to four pieces: maps wrap)
+  uint8_t *pwHaveOut, *pwHavePrio; int pwHaveN, pwHaveR[4][4], pwHaveOk;
                                            //   sub screen's where only it shows (motion.h: what the pixel moves with)
 } SceneData;
 
@@ -358,7 +425,8 @@ static void CtFreeSceneData(SceneData* sd) {
   free(sd->chips12); free(sd->pres12); free(sd->meta12);
   free(sd->chips3); free(sd->pres3); free(sd->meta3);
   free(sd->l1t); free(sd->l2t); free(sd->l3t); free(sd->tprio);
-  free(sd->animChips); free(sd->chipAnimDesc); free(sd->palAnimDesc); free(sd->prevChips); free(sd->bakeCov); free(sd->bakeMotCov); free(sd->bakeMain);
+  free(sd->animChips); free(sd->chipAnimDesc); free(sd->palAnimDesc); free(sd->prevChips); if (sd->bakeCov != sd->pwCov) free(sd->bakeCov); if (sd->bakeMotCov != sd->pwMot) free(sd->bakeMotCov); if (sd->bakeMain != sd->pwPre) free(sd->bakeMain);
+  free(sd->pwCov); free(sd->pwMot); free(sd->pwPre); free(sd->pwSubPx); free(sd->pwSubCov);
   for (int i = 0; i < 6; i++) { free(sd->layRgb[i]); free(sd->layCov[i]); sd->layRgb[i] = sd->layCov[i] = NULL; }
 }
 
@@ -466,6 +534,8 @@ static void CtLoadSceneFromRom(const uint8_t* rom, int index, int frame,
 // is non-NULL, also returns a 1-byte/pixel mask of BG1/BG2 priority-1 pixels (the foreground
 // tiles a field engine should draw OVER sprites), cropped to match the returned image.
 static int gSceneLayersOff = 0;   // BL1/BL2/BL3 bits removed from both screens for one compose (see below)
+// THE WINDOWED BAKE's arguments to CtComposeScene (set by CtFieldSceneBake only, for one call): the buffers to update in place and the pixel rectangle.
+static struct { int on, W, H, x0, y0, x1, y1; uint8_t *out, *prio, *cov, *mot, *pre, *subpx, *subcov; } gWin;
 static uint8_t* gSceneMotCov;     // CtComposeScene's motion coverage, when it is asked for the coverage (CtFieldSceneBake)
 static uint8_t* gSceneMainPre;    // ...and its main screen before the colour math (the same crop)
 static uint8_t* CtComposeScene(const SceneData* sd, int blend, int full, int* outW, int* outH, uint8_t** outPrio,
@@ -502,11 +572,13 @@ static uint8_t* CtComposeScene(const SceneData* sd, int blend, int full, int* ou
   int CW = sd->w1 > sd->w2 ? sd->w1 : sd->w2; if (sd->has_l3 && sd->w3 > CW) CW = sd->w3;
   int CH = sd->h1 > sd->h2 ? sd->h1 : sd->h2; if (sd->has_l3 && sd->h3 > CH) CH = sd->h3;
   int W = CW * 16, H = CH * 16;
-  uint8_t* main_px = calloc((size_t)W * H, 3);
-  uint8_t* main_cov = calloc((size_t)W * H, 1);
-  uint8_t* sub_px = calloc((size_t)W * H, 3);
-  uint8_t* sub_cov = calloc((size_t)W * H, 1);
-  uint8_t* priomask = outPrio ? calloc((size_t)W * H, 1) : NULL;
+  // (malloc, not calloc: each band of the bake clears its own rows -- on the host's pool, not one serial memset)
+  const int win = gWin.on && gWin.W == W && gWin.H == H && outPrio && outCov;   // (the windowed bake: update the host's buffers in place)
+  uint8_t* main_px = win ? gWin.out : malloc((size_t)W * H * 3);
+  uint8_t* main_cov = win ? gWin.cov : malloc((size_t)W * H);
+  uint8_t* sub_px = win ? gWin.subpx : malloc((size_t)W * H * 3);
+  uint8_t* sub_cov = win ? gWin.subcov : malloc((size_t)W * H);
+  uint8_t* priomask = outPrio ? (win ? gWin.prio : malloc((size_t)W * H)) : NULL;
   uint8_t palc[128][3]; memcpy(palc, sd->pal, sizeof(palc));
 
   LInfo li1 = { sd->l1t, sd->w1, sd->h1, sd->meta12, 512, sd->chips12, sd->pres12, 768, NULL, 1, 1, 0, 0, 0 };
@@ -522,44 +594,27 @@ static uint8_t* CtComposeScene(const SceneData* sd, int blend, int full, int* ou
   // sprite. Measured: the oracle's live BG1 tilemap at loc $081 has 392 priority-bit entries, the
   // pews at metatiles (4..6, 18..19) carry them (tileset 11 metas 213/214/216/229/200/232), and the
   // oracle draws the nuns (obj10/obj11, $0C00 = $0C01 = 0x20 = OBJ prio 2) BEHIND those pews.
-  draw_pass(main_px, main_cov, W, H, main_t, palc, &li1, &li2, &li3, priomask);
-  draw_pass(sub_px, sub_cov, W, H, sub_t, palc, &li1, &li2, &li3, priomask);
-
   // THE COLOUR MATH IS THE PPU'S, IN 5 BITS (snes/ppu.c ppu_handlePixel): add or subtract the sub-screen colour, halve,
   // THEN clamp to 0..31. The palette holds conv5 values, so >> 3 recovers each channel's 5 bits exactly. The 8-bit
   // `(d >> 1) + (s >> 1)` this used to do is off by up to 4 per channel -- every shadow BG2 half-adds over BG3 (the
   // tent keeper, CGADSUB = $42) and every BG3 glow full-adds over BG1/BG2 (scene 130, CGADSUB = $24) came out wrong.
-  uint8_t* pre = outCov ? malloc((size_t)W * H * 3) : NULL;   // the main screen as it stands before the math
-  if (pre) memcpy(pre, main_px, (size_t)W * H * 3);
-  if (sub_t) {
-    static const uint8_t BLACK[3] = { 0, 0, 0 };
-    for (int i = 0; i < W * H; i++) {
-      int o = i * 3, mc = main_cov[i], sc = sub_cov[i];
-      const uint8_t* inp = sc ? (sub_px + o) : BLACK;
-      if ((mc & blend_en) && sc) {
-        for (int k = 0; k < 3; k++) {
-          int d = main_px[o + k] >> 3, s = inp[k] >> 3;
-          int r = sub_op ? d - s : d + s;
-          if (half) r >>= 1;
-          if (r < 0) r = 0; if (r > 31) r = 31;
-          main_px[o + k] = (uint8_t)((r << 3) | (r >> 2));
-        }
-      } else if (mc == 0 && sc) {
-        memcpy(main_px + o, inp, 3);
-      }
-    }
-  }
   // ...AND A MAIN-SCREEN PIXEL NO LAYER COVERS IS THE BACKDROP, CGRAM 0 (the PPU's own rule: snes/ppu.c ppu_handlePixel
   // takes colour 0 when every layer is transparent). The compose left it at calloc's black, which is the same colour in
   // nearly every location -- their $7E:2200 word is 0000 -- but not where a script paints it: the combat tutorial (loc
   // 0FE, obj0 `4B 00 22 7E D8 5C` = C0/67FB: $2200 := 5CD8) shows it inside its iris (FF 90 -> C0/2214: window 1 takes
   // BG1/BG2 off, TM $17), and the cartridge's circle is that magenta (saves/field_re/scene254_tutorial.state, CGRAM[0] =
-  // 5CD8 in `--ppuregs`). The arm above keeps its sub-screen pixels; this is the rest.
-  for (int i = 0; i < W * H; i++)
-    if (!main_cov[i] && !(sub_t && sub_cov[i])) memcpy(main_px + (size_t)i * 3, palc[0], 3);
-  uint8_t* mot = NULL;
-  if (outCov && (mot = malloc((size_t)W * H)))
-    for (int i = 0; i < W * H; i++) mot[i] = main_cov[i] ? main_cov[i] : (sub_t && sub_cov[i]) ? sub_cov[i] : 0;
+  // 5CD8 in `--ppuregs`). The colour-math arm keeps its sub-screen pixels; the backdrop is the rest. (Both are bakeBand's.)
+  uint8_t* pre = outCov ? (win ? gWin.pre : malloc((size_t)W * H * 3)) : NULL;   // the main screen as it stands before the math
+  uint8_t* mot = outCov ? (win ? gWin.mot : malloc((size_t)W * H)) : NULL;
+  { const int ry0 = win ? gWin.y0 : 0, ry1 = win ? gWin.y1 : H;
+    BakeJob bj = { main_px, main_cov, sub_px, sub_cov, W, H, main_t, sub_t, palc, &li1, &li2, &li3, priomask,
+                   blend_en, sub_op, half, pre, mot, ry0, win ? gWin.x0 : 0, win ? gWin.x1 : W };
+    if (g_sceneParFor) g_sceneParFor(ry1 - ry0, 48, bakeBand, &bj); else bakeBand(&bj, 0, ry1 - ry0); }
+  if (win) {                                         // updated in place: nothing to crop, nothing to free
+    *outW = W; *outH = H; *outPrio = priomask; *outCov = main_cov;
+    gSceneMotCov = mot; gSceneMainPre = pre;                         // (the persistent arrays: aliased by the caller, never freed here -- not even by the next piece's compose)
+    return main_px;
+  }
 
   // crop to the scroll mask (metatiles; sm_full => whole layer 1)
   int cx0, cy0, cx1, cy1;
@@ -747,14 +802,110 @@ void CtFieldSceneClose(void* h) {
   CtFreeSceneData((SceneData*)h);
   free(h);
 }
+static void sceneCanvasSize(const SceneData* sd, int* W, int* H) {
+  int CW = sd->w1 > sd->w2 ? sd->w1 : sd->w2; if (sd->has_l3 && sd->w3 > CW) CW = sd->w3;
+  int CH = sd->h1 > sd->h2 ? sd->h1 : sd->h2; if (sd->has_l3 && sd->h3 > CH) CH = sd->h3;
+  *W = CW * 16; *H = CH * 16;
+}
+static int rectHolds(const int outer[4], const int inner[4]) { return outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]; }
+// A rectangle of canvas pixels that may run past an edge (the map wraps: the host reads the same pixels from the other side), as up to four pieces
+// inside [0,W) x [0,H). 0 = a rectangle as wide or as tall as the canvas itself.
+static int rectPieces(int x0, int y0, int x1, int y1, int W, int H, int out[4][4]) {
+  if (x1 <= x0 || y1 <= y0 || x1 - x0 >= W || y1 - y0 >= H) return 0;
+  int xa[2][2], ya[2][2], xn, yn;
+  { int m = ((x0 % W) + W) % W, b = x1 + (m - x0);
+    if (b <= W) { xa[0][0] = m; xa[0][1] = b; xn = 1; } else { xa[0][0] = m; xa[0][1] = W; xa[1][0] = 0; xa[1][1] = b - W; xn = 2; } }
+  { int m = ((y0 % H) + H) % H, b = y1 + (m - y0);
+    if (b <= H) { ya[0][0] = m; ya[0][1] = b; yn = 1; } else { ya[0][0] = m; ya[0][1] = H; ya[1][0] = 0; ya[1][1] = b - H; yn = 2; } }
+  int n = 0;
+  for (int i = 0; i < xn; i++) for (int j = 0; j < yn; j++) { out[n][0] = xa[i][0]; out[n][1] = ya[j][0]; out[n][2] = xa[i][1]; out[n][3] = ya[j][1]; n++; }
+  return n;
+}
+
+// THE WINDOWED BAKE. The host (field.c) reads the baked picture only around its camera; it says which rectangle (the view [vx0,vx1) x [vy0,vy1) in
+// pixels) and how generously: `need` = the view +- m1 is what must be current for it to draw; `bake` = the view +- m2 is what a bake recomputes (m2 > m1:
+// the camera may move m2 - m1 pixels before the next bake is forced). `out` / `prio` are the host's picture and priority mask (W x H canvas), updated in
+// place. A rectangle that runs past an edge is baked as the pieces on each side (the host reads wrapped coordinates); one as large as the canvas, a
+// zero rectangle or different destination pointers = windowing off: the next bake is a full one.
+void CtFieldSceneSetBakeWindow(void* h, int vx0, int vy0, int vx1, int vy1, int m1, int m2, uint8_t* out, uint8_t* prio, int W, int H) {
+  SceneData* sd = (SceneData*)h;
+  if (!sd) return;
+  sd->pwOn = 0;
+  if (vx1 <= vx0 || vy1 <= vy0 || !out || !prio || W <= 0 || H <= 0) return;
+  int nn = rectPieces(vx0 - m1, vy0 - m1, vx1 + m1, vy1 + m1, W, H, sd->pwNeedR);
+  if (!nn) return;                                              // (as wide or as tall as the canvas: a full bake)
+  int bn = rectPieces(vx0 - m2, vy0 - m2, vx1 + m2, vy1 + m2, W, H, sd->pwBakeR);
+  if (!bn) { sd->pwBakeR[0][0] = 0; sd->pwBakeR[0][1] = 0; sd->pwBakeR[0][2] = W; sd->pwBakeR[0][3] = H; bn = 1; }   // (the margin reaches round the canvas: all of it)
+  sd->pwNeedN = nn; sd->pwBakeN = bn;
+  sd->pwReqOut = out; sd->pwReqPrio = prio; sd->pwReqW = W; sd->pwReqH = H; sd->pwOn = 1;
+}
+// 0 = a windowed bake is wanted: the region the destination holds for the current state does not hold the rectangle the host needs. 1 otherwise.
+int CtFieldSceneBakeCovers(void* h) {
+  SceneData* sd = (SceneData*)h;
+  if (!sd || !sd->pwOn) return 1;
+  if (!sd->pwHaveOk || sd->pwHaveOut != sd->pwReqOut || sd->pwHavePrio != sd->pwReqPrio) return 1;     // (no in-place bake possible: nothing to force)
+  for (int i = 0; i < sd->pwNeedN; i++) {                       // each needed piece inside one baked piece (conservative: a piece spread over two forces a bake)
+    int held = 0;
+    for (int j = 0; j < sd->pwHaveN && !held; j++) held = rectHolds(sd->pwHaveR[j], sd->pwNeedR[i]);
+    if (!held) return 0;
+  }
+  return 1;
+}
+// The last bake's pieces (a probe for the host's stats and the tests): returns how many, and fills `out`.
+int CtFieldSceneBakeWindowPieces(void* h, int out[4][4]) {
+  SceneData* sd = (SceneData*)h; if (!sd) return 0;
+  for (int i = 0; i < sd->pwHaveN; i++) for (int k = 0; k < 4; k++) out[i][k] = sd->pwHaveR[i][k];
+  return sd->pwHaveN;
+}
+
 uint8_t* CtFieldSceneBake(void* h, int* outW, int* outH, uint8_t** outPrioMask) {
   SceneData* sd = (SceneData*)h;
+  int W = 0, H = 0; sceneCanvasSize(sd, &W, &H);
+  const int win = sd->pwOn && outPrioMask && sd->pwHaveOk && sd->pwHaveOut == sd->pwReqOut && sd->pwHavePrio == sd->pwReqPrio &&
+                  sd->pwReqW == W && sd->pwReqH == H && W > 0 && H > 0;
+  if (win) {
+    if (sd->pwW != W || sd->pwH != H || !sd->pwCov) {            // the persistent arrays, once per canvas size
+      free(sd->pwCov); free(sd->pwMot); free(sd->pwPre); free(sd->pwSubPx); free(sd->pwSubCov);
+      sd->pwCov = (uint8_t*)calloc((size_t)W * H, 1); sd->pwMot = (uint8_t*)calloc((size_t)W * H, 1);
+      sd->pwPre = (uint8_t*)calloc((size_t)W * H, 3); sd->pwSubPx = (uint8_t*)calloc((size_t)W * H, 3); sd->pwSubCov = (uint8_t*)calloc((size_t)W * H, 1);
+      sd->pwW = W; sd->pwH = H;
+    }
+    if (sd->pwCov && sd->pwMot && sd->pwPre && sd->pwSubPx && sd->pwSubCov) {
+      // (the first windowed bake after a full one: the aliased bakeCov / bakeMotCov / bakeMain become the persistent arrays, whose content outside the
+      //  pieces is not the bake's -- the host reads only inside them)
+      uint8_t* out = NULL;
+      for (int i = 0; i < sd->pwBakeN; i++) {                    // one compose per piece (up to four: a rectangle across a wrapped edge)
+        gWin.on = 1; gWin.W = W; gWin.H = H; gWin.x0 = sd->pwBakeR[i][0]; gWin.y0 = sd->pwBakeR[i][1]; gWin.x1 = sd->pwBakeR[i][2]; gWin.y1 = sd->pwBakeR[i][3];
+        gWin.out = sd->pwReqOut; gWin.prio = sd->pwReqPrio; gWin.cov = sd->pwCov; gWin.mot = sd->pwMot; gWin.pre = sd->pwPre;
+        gWin.subpx = sd->pwSubPx; gWin.subcov = sd->pwSubCov;
+        uint8_t* cov = NULL;
+        uint8_t* o = CtComposeScene(sd, 1, 1, outW, outH, outPrioMask, &cov);
+        gWin.on = 0;
+        if (!o) { out = NULL; break; }
+        out = o;
+      }
+      if (out) {
+        if (sd->bakeCov != sd->pwCov) free(sd->bakeCov);
+        sd->bakeCov = sd->pwCov; sd->bakeCovW = *outW; sd->bakeCovH = *outH;
+        if (sd->bakeMotCov != sd->pwMot) free(sd->bakeMotCov);
+        sd->bakeMotCov = sd->pwMot; gSceneMotCov = NULL; sd->layDirty = 1;
+        if (sd->bakeMain != sd->pwPre) free(sd->bakeMain);
+        sd->bakeMain = sd->pwPre; gSceneMainPre = NULL;
+        sd->bakedO[0] = sd->l2ox; sd->bakedO[1] = sd->l2oy; sd->bakedO[2] = sd->l3ox; sd->bakedO[3] = sd->l3oy;
+        sd->pwHaveN = sd->pwBakeN; memcpy(sd->pwHaveR, sd->pwBakeR, sizeof sd->pwHaveR); sd->pwHaveOk = 1;
+        return out;
+      }
+    }
+  }
   uint8_t* cov = NULL;
   uint8_t* out = CtComposeScene(sd, 1, 1, outW, outH, outPrioMask, &cov);
-  if (out) { free(sd->bakeCov); sd->bakeCov = cov; sd->bakeCovW = *outW; sd->bakeCovH = *outH;
-             free(sd->bakeMotCov); sd->bakeMotCov = gSceneMotCov; gSceneMotCov = NULL; sd->layDirty = 1;
-             free(sd->bakeMain); sd->bakeMain = gSceneMainPre; gSceneMainPre = NULL;
-             sd->bakedO[0] = sd->l2ox; sd->bakedO[1] = sd->l2oy; sd->bakedO[2] = sd->l3ox; sd->bakedO[3] = sd->l3oy; }
+  if (out) { if (sd->bakeCov != sd->pwCov) free(sd->bakeCov); sd->bakeCov = cov; sd->bakeCovW = *outW; sd->bakeCovH = *outH;
+             if (sd->bakeMotCov != sd->pwMot) free(sd->bakeMotCov); sd->bakeMotCov = gSceneMotCov; gSceneMotCov = NULL; sd->layDirty = 1;
+             if (sd->bakeMain != sd->pwPre) free(sd->bakeMain); sd->bakeMain = gSceneMainPre; gSceneMainPre = NULL;
+             sd->bakedO[0] = sd->l2ox; sd->bakedO[1] = sd->l2oy; sd->bakedO[2] = sd->l3ox; sd->bakedO[3] = sd->l3oy;
+             // a FULL bake: the whole canvas is current, in the pointers it handed back
+             sd->pwHaveOut = out; sd->pwHavePrio = outPrioMask ? *outPrioMask : NULL; sd->pwHaveOk = sd->pwHavePrio != NULL;
+             sd->pwHaveN = 1; sd->pwHaveR[0][0] = 0; sd->pwHaveR[0][1] = 0; sd->pwHaveR[0][2] = *outW; sd->pwHaveR[0][3] = *outH; }
   else free(cov);
   return out;
 }
@@ -835,7 +986,7 @@ int CtFieldSceneLayers(void* h, CtSceneLayers* o) {
       memset(sd->layRgb[i], 0, (size_t)LW * LH * 3); memset(sd->layCov[i], 0, (size_t)LW * LH);
       if (ordLay[i] == 2 && !sd->has_l3) continue;
       draw_layer(sd->layRgb[i], sd->layCov[i], LW, LH, L->tiles, L->lw, L->lh, L->metas, L->nmeta, L->chips, L->present,
-                 L->nchips, palc, ordPri[i], ordBit[i], NULL, L->tprio, L->tpw, L->tph, 0, 0, L->mapRing);
+                 L->nchips, palc, ordPri[i], ordBit[i], NULL, L->tprio, L->tpw, L->tph, 0, 0, L->mapRing, 0, LH, 0, LW);
     }
     sd->layDirty = 0;
   }

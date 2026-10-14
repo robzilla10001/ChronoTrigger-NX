@@ -1137,6 +1137,8 @@ const uint8_t* CtBattleStripVramLive(void);
 //   CtBattleRun    — synchronous convenience (Begin, then loop { Tick(frame ? frame(ctx) : 0, 0) }); the
 //                    input comes from CT_BATTLE_MASHA / CT_BATTLE_SCRIPT (headless). Returns glb[0x1EC].
 void CtBattleBegin(CtBattleHost* h);
+// A host hook for TIMING CtBattleBegin's stages (hoststats; NULL = none): called with 0 at the start, then 1..5 after each stage. Reads no state.
+extern void (*CtBattleLapHook)(int stage);
 int  CtBattleTick(CtBattleHost* h, int endRequest, int input);
 int  CtBattleRun(CtBattleHost* h);
 

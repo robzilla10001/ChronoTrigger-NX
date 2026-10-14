@@ -68,6 +68,10 @@ int      CtAudioPost(CtAudio* a, uint8_t p0, uint8_t p1, uint8_t p2, uint8_t p3)
 // the way out like $C7:0192 does. Returns 1 if a command was consumed, 0 if
 // there was nothing to do, and -1 for a command whose handler is not yet
 // derived (the caller may log it; the mailbox is still cleared, as the ROM does).
+// A host clock (ms) for TIMING the handshake entry points (CtAudioService, CtAudioColdBoot, CtAudioWaitReplyNibble): a song / sample-set load runs the
+// driver protocol cycle by cycle in one host frame. NULL = not timed. CtAudioHeavyTakeMs returns the ms spent since the last call.
+extern double (*CtAudioClockHook)(void);
+double   CtAudioHeavyTakeMs(void);
 int      CtAudioService(CtAudio* a, uint8_t* mem7E);
 // The LOADER CLOCK (audio.c, song_load_freeze.md section 6): every CtAudioService re-runs the JSL's
 // master cycles -- the listing's instruction costs, the emulated SPC caught up before each port access,

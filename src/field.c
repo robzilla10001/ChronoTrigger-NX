@@ -148,7 +148,7 @@ static int hostTrace(void) {
   if (tr < 0) { const char* e = getenv("CT_HOST_TRACE"); tr = (e && *e) ? 1 : 0; }
   return tr;
 }
-static void hostPace(void) {             // called once per engine frame, after its present
+static void hostPaceImpl(void) {         // called once per engine frame, after its present
   double now = hostNowMs();
   if (g_hostT0 < 0) g_hostT0 = now;
   g_hostFrames++;
@@ -171,6 +171,19 @@ static void hostPace(void) {             // called once per engine frame, after 
   }
   double late = now - due;
   int tr = hostTrace();
+#ifdef __SWITCH__
+  // A HOST that cannot hold 60 f/s runs the game slower instead of dropping pictures: a present costs ~2 ms of a 13-41 ms frame
+  // there (measured, hoststats), so skipping them saved nothing. And a frame that runs long (the scene bake lands every 3-4
+  // frames at 25-30 ms in the forest) is PAID BACK by the cheap frames after it, up to twelve frames (200 ms) behind: a load, a bake or a sound-driver handshake (song / sample-set
+  // load: 102-127 ms on the base clocks, measured by the spike log) is one long frame INSIDE a stretch the game itself holds frozen for frames,
+  // so the cheap frames after it pay it back; a drop of it lost the time for good. Only a pile-up beyond that is dropped (re-anchored). Re-anchoring on the first late frame, as this did, lost every spike for good: the
+  // forest averaged 12.9 ms of work and still ran at 53 f/s.
+  if (late > HOST_FRAME_MS * 12.0) {
+    g_hostT0 += late; g_hostDroppedMs += late; g_hostReanchors++;
+  }
+  g_hostSkipPresent = 0;
+  return;
+#endif
   if (late > HOST_STALL_MS) {            // a stall: re-anchor, picture and sound drop it together
     if (tr) fprintf(stderr, "host: frame %ld late %.1f ms -- STALL, re-anchored\n", g_hostFrames, late);
     g_hostT0 += late; g_hostDroppedMs += late; g_hostReanchors++;
@@ -180,10 +193,52 @@ static void hostPace(void) {             // called once per engine frame, after 
   g_hostSkipPresent = late >= HOST_FRAME_MS;
   if (tr && g_hostSkipPresent) fprintf(stderr, "host: frame %ld late %.1f ms -- next present skipped\n", g_hostFrames, late);
 }
+static double g_paceLastExit = -1.0;      // (the end of the last paced frame; the options modal resets it: its time is not a frame's)
+static void hostPace(void) {             // the pace above, timed for hoststats.h (clocks only)
+  double t0 = hostNowMs();
+  long skipsBefore = g_hostSkipPresent;
+  hostPaceImpl();
+  double t1 = hostNowMs();
+  CtStatsPresent(CT_ST_XAUD, CtAudioHeavyTakeMs());   // (the sound-driver handshakes this frame ran: song / sample-set loads)
+  double tm0 = hostNowMs();
+  CtSwitchBoostFrame();                              // (the Switch host: keep the CPU at its clock -- read back, re-asserted)
+  if (g_paceLastExit >= 0 && t0 - g_paceLastExit > 60.0) CtSwitchBoostNudge();   // a long frame = a load: the clock tends to drop around those
+  { static int tick; if (++tick >= 20) { tick = 0; CtSwitchClockTick(); } }       // the bench + status line, ~3 times a second
+  CtStatsPresent(CT_ST_XMISC, hostNowMs() - tm0);
+  if (g_paceLastExit >= 0) CtStatsFrame(t0 - g_paceLastExit, t1 - t0);
+  if (g_hostSkipPresent && !skipsBefore) CtStatsPresentSkipped();
+  g_paceLastExit = t1;
+}
 // THE PLAYER'S PICTURE OPTIONS (settings.h): where the 256x224 picture sits in the window -- fit (letterboxed), integer
 // (the largest whole multiple of the lines), or stretched -- at square pixels (8:7) or the console's 4:3. Only an
 // interactive run places it (g_hostInteractive); a headless one keeps the old full-target copy under the logical size.
 static int g_hostInteractive = 0;
+// (hoststats) the scene bake and the layer canvases, timed: a battle effect that touches the screen settings re-bakes the whole scene map
+static uint8_t* hostSceneBake(void* sd, int* w, int* h, uint8_t** prio) {      // (a FULL bake: any window the field set is cleared first)
+  CtFieldSceneSetBakeWindow(sd, 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0);
+  double t0 = CtStatsNow(); uint8_t* r = CtFieldSceneBake(sd, w, h, prio); CtStatsPresent(CT_ST_XBAKE, CtStatsNow() - t0); return r;
+}
+static uint8_t* hostSceneBakeWin(void* sd, int* w, int* h, uint8_t** prio) {   // (the field's bake: the window set by hostBakeWindow, if any, stays)
+  double t0 = CtStatsNow(); uint8_t* r = CtFieldSceneBake(sd, w, h, prio); CtStatsPresent(CT_ST_XBAKE, CtStatsNow() - t0);
+  if (r && *w > 0 && *h > 0) { int pc[4][4]; int n = CtFieldSceneBakeWindowPieces(sd, pc); double area = 0;      // (the share of the canvas this bake recomputed)
+    for (int i = 0; i < n; i++) area += (double)(pc[i][2] - pc[i][0]) * (double)(pc[i][3] - pc[i][1]);
+    CtStatsPresent(CT_ST_XBAKEPCT, 100.0 * area / ((double)*w * (double)*h)); }
+  return r;
+}
+static uint8_t* hostSceneBakeB3(void* sd, int off, int* w, int* h) {
+  double t0 = CtStatsNow(); uint8_t* r = CtFieldSceneBakeLayersOff(sd, off, w, h); CtStatsPresent(CT_ST_XBAKEB3, CtStatsNow() - t0); return r;
+}
+static int hostSceneLayers(void* sd, CtSceneLayers* L) {
+  double t0 = CtStatsNow(); int r = CtFieldSceneLayers(sd, L); CtStatsPresent(CT_ST_XLAYERS, CtStatsNow() - t0); return r;
+}
+static void hostBattleLap(int stage) {                                     // CtBattleBegin's stages, timed (battle.h CtBattleLapHook)
+  static double last; double now = CtStatsNow();
+  if (stage > 0 && stage <= 5) CtStatsPresent(CT_ST_XB1 + stage - 1, now - last);
+  last = now;
+}
+static int hostBattleTick(CtBattleHost* h, int endReq, int input) {      // (hoststats: the battle module's frame, timed)
+  double t0 = CtStatsNow(); int r = CtBattleTick(h, endReq, input); CtStatsPresent(CT_ST_XBAT, CtStatsNow() - t0); return r;
+}
 // THE FREE SYNC MODE (settings.h `sync`, the F1 overlay's Sync tab): the waits that exist only because the SNES's CPU,
 // SPC or DMA took that long -- the song uploads that park the field's scripts (and the battle's boot and exit), a
 // location's load, the field's reload after the menu, the overworld's inline sound JSL -- cost no frames. Everything the
@@ -211,8 +266,9 @@ static void hostDstRect(CtPresenter* pr, SDL_Rect* r) {
   r->x = (ow - w) / 2; r->y = (oh - h) / 2; r->w = w; r->h = h;
 }
 static void hostDrawPicture(CtPresenter* pr) {
-  if (g_hostInteractive) { SDL_Rect d; hostDstRect(pr, &d); CtPresentDraw(pr, &d, CtSettingsGet()->linearFilter); }
-  else CtPresentDraw(pr, NULL, 0);
+  int rw, rh, ow, oh; CtPresentPicSize(pr, &rw, &rh); CtPresentOutputSize(pr, &ow, &oh);
+  if (g_hostInteractive) { SDL_Rect d; hostDstRect(pr, &d); CtStatsResolution(rw, rh, d.w, d.h, ow, oh); CtPresentDraw(pr, &d, CtSettingsGet()->linearFilter); }
+  else { CtStatsResolution(rw, rh, ow, oh, ow, oh); CtPresentDraw(pr, NULL, 0); }
 }
 // The window's size for the options: the picture at `windowScale` (4:3 widens it).
 static void hostWindowSize(int* w, int* h) {
@@ -1770,6 +1826,21 @@ static void worldComposeAt(World* w, uint8_t* fb, int W, int X0, const CtWorldSt
   owWindow1Pass(w, fb, owSubFb, W, X0);
 }
 static void worldCompose(World* w, uint8_t* fb) { worldComposeAt(w, fb, CAMW, 0, &w->stm); }
+// THE LEAD'S POSE STATE, advanced without composing: the part of worldComposeAt(X0 == 0) that is STATE, not picture (its lines
+// `pdesc` .. `owLastDesc`, above). With the widescreen on, the 256 compose that used to run beside the wide one only supplied the
+// centre strip (byte-identical to the wide frame's centre -- measured, 0 of 10M pixels over the world test) and this state; the strip
+// is copied now and this is the state. Same inputs, same order: both composes read owDescPrev first, the offset-0 one then wrote it.
+static void worldPoseAdvance(World* w) {
+  int lb = w->wram ? CtWorldLeadBlock(w->wram) : -1;
+  if (w->wram && owBootstrapObjects() && !CtWorldHasLead(w->wram)) lb = -1;
+  int pnow = (lb >= 0) ? CtWorldAnimDesc(w->wram + lb) : -1;
+  int pdesc = w->owComposeN >= 1 ? w->owDescPrev : pnow;
+  w->owDescPrev = pnow; w->owComposeN++;
+  if (pdesc != w->owLastDesc) {
+    if (w->owComposeN > 1 && w->owFlipN < 8) { w->owFlipF[w->owFlipN] = w->owComposeN; w->owFlipD[w->owFlipN] = pdesc; w->owFlipN++; }
+    w->owLastDesc = pdesc;
+  }
+}
 
 // The frame between two overworld frames at `t` (/256), k x k output pixels a picture pixel, drawn from what the frame is
 // made of (OwNat): BG1 / BG2 from their tilemaps at the camera's scroll at t (and BG2's own on top), BG3 at its own (the
@@ -2247,7 +2318,7 @@ static uint8_t* g_hostPic; static size_t g_hostPicN;
 // frames with the matrix interpolated. g_hostTi is that frame's machine; g_hostTiPrev the latch the frame before it drew.
 static const CtTitleIntro* g_hostTi;
 static struct CtTiLatch g_hostTiPrev; static int g_hostTiPrevOk, g_hostTiChain;
-static void hostUploadPictureAt(CtPresenter* pr, const uint8_t* fb, int w, int t, int interp) {
+static void hostUploadPictureAtImpl(CtPresenter* pr, const uint8_t* fb, int w, int t, int interp) {
   int k = g_hostInteractive ? CtSettingsGet()->renderScale : 1;
   if (k < 1) k = 1; if (k > 4) k = 4;
   if (interp && k == 1) k = 4;                     // (between two frames a whole pixel is too coarse a step)
@@ -2264,6 +2335,11 @@ static void hostUploadPictureAt(CtPresenter* pr, const uint8_t* fb, int w, int t
   }
   fb = hostFitWidth(fb, &w);
   if (k == 1) { CtPresentSetPicSize(pr, w, CAMH); CtPresentUpload(pr, fb); return; }
+  static int noFused = -1; if (noFused < 0) noFused = getenv("CT_NO_FUSED_UPSCALE") != NULL;   // (A/B switch: the old two-step path)
+  if (t >= 256 && !noFused) {                      // the frame itself (every frame of a 60 Hz display): the plain upscale -- CtMotRaster's first
+    CtPresentSetPicSize(pr, w * k, CAMH * k);      //   arm for t >= 256 -- written straight into the texture's RGBA, no RGB24 picture between
+    if (CtPresentUploadScaled(pr, fb, w, k)) return;
+  }
   size_t n = (size_t)w * k * CAMH * k * 3;
   if (g_hostPicN < n) { free(g_hostPic); g_hostPic = (uint8_t*)malloc(n); g_hostPicN = g_hostPic ? n : 0; }
   if (!g_hostPic) { CtPresentSetPicSize(pr, w, CAMH); CtPresentUpload(pr, fb); return; }
@@ -2273,6 +2349,11 @@ static void hostUploadPictureAt(CtPresenter* pr, const uint8_t* fb, int w, int t
     CtMotRaster(&g_motBuf[g_motIdx], &g_motBuf[g_motIdx ^ 1], fb, w, t, k, g_hostPic);
   CtPresentSetPicSize(pr, w * k, CAMH * k);
   CtPresentUpload(pr, g_hostPic);
+}
+static void hostUploadPictureAt(CtPresenter* pr, const uint8_t* fb, int w, int t, int interp) {
+  double st0 = CtStatsNow();                       // (hoststats: the picture's build + its upload; the upload alone is timed in present.c)
+  hostUploadPictureAtImpl(pr, fb, w, t, interp);
+  CtStatsPresent(CT_ST_PICTURE, CtStatsNow() - st0);
 }
 static void hostUploadPicture(CtPresenter* pr, const uint8_t* fb) { hostUploadPictureAt(pr, fb, CAMW, 256, 0); }
 // This frame's picture is the title machine's: the latch it drew from, and the one before it (if that frame drew it too).
@@ -4146,6 +4227,33 @@ typedef struct {
 } Field;                          // a scene map holds many rooms -- the camera stays in THIS one
 // The canvas pixel the screen shows at map pixel (x, y): the BG tilemap repeats the map (C0/7612 `AND $1E` / `AND $1F`
 // over the metatile column and row), so a camera whose screen runs past the canvas reads the map again from its start.
+// THE WINDOWED BAKE, the field's side (scene.c CtFieldSceneSetBakeWindow). The baked scene picture is read only around the camera -- the view
+// plus the widescreen's sides plus a little (the battle's shake, the frames between's reprojection: 32 px) -- while a bake used to recompute the whole
+// map: 590k pixels for the forest, of which ~76k are ever drawn, every few frames while its tiles animate. Now a bake recomputes the camera's rectangle
+// (view +- 88 px) in place, and the window is renewed when the camera leaves the part that is current (the view +- 40 px). A view that reaches past the
+// canvas (maps wrap) is a full bake. On by default on the Switch only; CT_BAKE_WINDOW=1 / 0 overrides.
+static int g_bakeWin = -1;
+static void hostBakeWindow(Field* f, int battle) {
+  if (g_bakeWin < 0) {
+    const char* e = getenv("CT_BAKE_WINDOW");
+#ifdef __SWITCH__
+    g_bakeWin = e ? atoi(e) != 0 : 1;
+#else
+    g_bakeWin = e ? atoi(e) != 0 : 0;
+#endif
+  }
+  if (!f->sd) return;
+  if (!g_bakeWin || !f->vm || !f->base || !f->prio) { CtFieldSceneSetBakeWindow(f->sd, 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0); return; }
+  int cx = 0, cy = 0; CtSceneCameraPx(f->vm, &cx, &cy); cy += 1;                // (the compose's own camera: camy + 1)
+  int ww = hostWideW(); if (ww < CAMW) ww = CAMW;
+  // (a fight's camera does not scroll: the slack beyond what must be current -- 40 px: the shake, the reprojection -- is only for a moving camera)
+  CtFieldSceneSetBakeWindow(f->sd, cx - (ww - CAMW), cy, cx + ww, cy + CAMH, 40, battle ? 48 : 88, f->base, f->prio, f->W, f->H);
+}
+// A bake's result: the same buffers updated in place (the windowed bake), or new ones that replace the old.
+static void hostAdoptBake(Field* f, uint8_t* nb, uint8_t* nprio, int nw, int nh) {
+  if (nb == f->base && nprio == f->prio) { f->W = nw; f->H = nh; return; }
+  free(f->base); free(f->prio); f->base = nb; f->prio = nprio; f->W = nw; f->H = nh;
+}
 static inline size_t fieldBaseAt(const Field* f, int x, int y) {
   x %= f->W; if (x < 0) x += f->W;
   y %= f->H; if (y < 0) y += f->H;
@@ -4181,6 +4289,78 @@ static int fieldBeyondPixel(const CtSceneLayers* L, int det, int mx, int my, int
     memcpy(out, L->rgb[i] + q * 3, 3); return bitOf[i];
   }
   memcpy(out, L->backdrop, 3); return 0;
+}
+
+// THE WIDESCREEN BATTLE ARENA'S PIXELS, one row range of them (the host's pool: the loop was ~76,000 pixels a frame, four modulos
+// and several lookups each). Every pixel is a pure function of its (x, y) and the read-only scene, so the rows may be drawn in any
+// order on any thread; the result is the same bytes.
+typedef struct { const Field* f; const CtSceneLayers* bl; int bdet, bwW, camx, camy, bx0, bwm0, bwm1; const int16_t* bwD;
+                 int o2x, o2y, o3x, o3y; const uint8_t* cvs; int cvW, cvH; uint8_t* bcov; } BwArena;
+static void bwArenaRows(void* ctx, int y0, int y1) {
+  const BwArena* a = (const BwArena*)ctx;
+  for (int y = y0; y < y1; y++)
+    for (int x = 0; x < a->bwW; x++) {
+      int ux = a->camx - a->bx0 + x, sy = a->camy + y; size_t i = (size_t)y * a->bwW + x;
+      int ax = ux + a->bwD[y * 2], ay = sy + a->bwD[y * 2 + 1];   // (the map moves under the room's edge with the shake)
+      if (ax < a->bwm0 || ax >= a->bwm1) {             // the room's end (its self-scrolling layers go on: fieldBeyondPixel)
+        if (a->bdet) fieldBeyondPixel(a->bl, a->bdet, ax, ay, a->o2x, a->o2y, a->o3x, a->o3y, g_bwFb + i * 3);
+        else memset(g_bwFb + i * 3, 0, 3);
+        a->bcov[i] = 0; continue; }
+      memcpy(g_bwFb + i * 3, a->f->base + fieldBaseAt(a->f, ax, ay) * 3, 3);
+      // (the arena's layer there, wrapping as the map does -- past a room as wide as its map is the map again)
+      //  (unshifted by the row's battle scroll, as the view's own lookup above)
+      a->bcov[i] = (a->cvs && a->cvW > 0 && a->cvH > 0) ? a->cvs[(size_t)((sy % a->cvH + a->cvH) % a->cvH) * a->cvW + (size_t)((ux % a->cvW + a->cvW) % a->cvW)] : 0;
+    }
+}
+
+// THE WIDESCREEN BATTLE'S ASSEMBLY, row ranges (the host's pool): the wide picture's rows, and the frames-between canvases (the arena's
+// canvas, the shown picture's wide copy, the owners widened). Every row reads and writes only its own row of each buffer; the sources
+// the loops used to overwrite in place are the snapshots g_bwOwnV / g_bwPicV taken before.
+static uint8_t g_bwCanvas[FIELD_WMAX * CAMH * 3], g_bwOwnV[CAMW * CAMH], g_bwPicV[CAMW * CAMH * 3];
+typedef struct { const uint8_t* fb; int bbr; } BwAsmA;
+static void bwAsmRowsA(void* ctx, int y0, int y1) {
+  const BwAsmA* J = (const BwAsmA*)ctx; const uint8_t* fb = J->fb; const int bbr = J->bbr;
+  for (int y = y0; y < y1; y++) {
+    memcpy(g_wide + (size_t)y * g_bwW * 3, g_bwFb + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
+    if (g_bwX == g_bwXc) { memcpy(g_wide + ((size_t)y * g_bwW + g_bwX) * 3, fb + (size_t)y * CAMW * 3, (size_t)CAMW * 3); continue; }
+    // (the camera stopped at the room's edge: the world -- the arena, the fighters -- where it stands, the boxes and
+    //  the HUD at the middle; under a box the world is the view before the boxes)
+    // (the HUD band's rows: the view drew its arena there unmoved -- the HUD covers it in the 256 picture -- but beside
+    //  the HUD it shows, so where nothing was drawn over that arena (the world still the canvas before the combatants)
+    //  the world is the wide arena's, which moves with the shake: g_bwBand)
+    const uint8_t* v = fb + (size_t)y * CAMW * 3; const uint8_t* wv = g_bWorld + (size_t)y * CAMW * 3;
+    const uint8_t* cv = g_bMotCanvas + (size_t)y * CAMW * 3; const uint8_t* av = g_bwPre + ((size_t)y * g_bwW + g_bwX) * 3;
+    for (int vx = 0; vx < CAMW; vx++) {
+      const uint8_t* wp = (g_bwBand[y] && !memcmp(wv + vx * 3, cv + vx * 3, 3)) ? av + vx * 3 : wv + vx * 3;
+      uint8_t e[3]; for (int c = 0; c < 3; c++) e[c] = (uint8_t)(bbr >= 15 ? wp[c] : bbr <= 0 ? 0 : wp[c] * bbr / 15);
+      memcpy(g_wide + ((size_t)y * g_bwW + g_bwX + vx) * 3, e, 3);
+    }
+    for (int vx = 0; vx < CAMW; vx++) {               // (the view's pixel that is its world's stays the world's above)
+      const uint8_t* wp = wv + vx * 3; int same = 1;
+      for (int c = 0; c < 3; c++) { int e = bbr >= 15 ? wp[c] : bbr <= 0 ? 0 : wp[c] * bbr / 15; if (e != v[vx * 3 + c]) same = 0; }
+      if (!same) memcpy(g_wide + ((size_t)y * g_bwW + g_bwXc + vx) * 3, v + vx * 3, 3);
+    }
+  }
+}
+typedef struct { CtMotFrame* mot; } BwAsmB;
+static void bwAsmRowsB(void* ctx, int y0, int y1) {
+  const BwAsmB* J = (const BwAsmB*)ctx; CtMotFrame* mot = J->mot;
+  for (int y = y0; y < y1; y++) {
+    memcpy(g_bwCanvas + (size_t)y * g_bwW * 3, g_bwPre + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
+    if (!(g_bwBand[y] && g_bwX != g_bwXc))         // (the HUD band beside a stopped camera: the wide arena's, as shown)
+      memcpy(g_bwCanvas + ((size_t)y * g_bwW + g_bwX) * 3, g_bMotCanvas + (size_t)y * CAMW * 3, (size_t)CAMW * 3);
+    memcpy(g_motPic + (size_t)y * g_bwW * 3, g_bwPre + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
+    const int band = g_bwBand[y] && g_bwX != g_bwXc;
+    for (int vx = 0; vx < CAMW; vx++) {
+      const uint8_t* p = g_bwPicV + ((size_t)y * CAMW + vx) * 3;
+      if (band && !memcmp(p, g_bMotCanvas + ((size_t)y * CAMW + vx) * 3, 3)) continue;
+      memcpy(g_motPic + ((size_t)y * g_bwW + g_bwX + vx) * 3, p, 3);
+    }
+    for (int x = 0; x < g_bwW; x++) {
+      int xv = x - g_bwX;
+      mot->own[y * g_bwW + x] = (xv >= 0 && xv < CAMW) ? g_bwOwnV[y * CAMW + xv] : (uint8_t)CT_MOT_BG1;
+    }
+  }
 }
 
 // ---- THE PROCESS-LIFETIME $7E (disasm/notes/wram_lifetime.md, wram_load_census.md) ----
@@ -4975,7 +5155,7 @@ static void fieldMapFromWram(Field* f, const uint8_t* sw, const char* tag) {
   int cd = CtFieldSceneSetCgram(f->sd, g_fieldCgram);
   if (md | td | cd) {
     int nw = 0, nh = 0; uint8_t* nprio = NULL;
-    uint8_t* nb = CtFieldSceneBake(f->sd, &nw, &nh, &nprio);
+    uint8_t* nb = hostSceneBake(f->sd, &nw, &nh, &nprio);
     if (nb) { free(f->base); free(f->prio); f->base = nb; f->prio = nprio; f->W = nw; f->H = nh; } else free(nprio);
   }
   int cc = fieldCollFromWram(&f->C, sw);
@@ -5761,7 +5941,7 @@ static int fieldLoad(CtAssets* a, Field* f, int scene, const uint8_t* gmem) {
                  bumped ? "bumped" : "unchanged");
       }
   }
-  f->base = f->sd ? CtFieldSceneBake(f->sd, &f->W, &f->H, &f->prio)
+  f->base = f->sd ? hostSceneBake(f->sd, &f->W, &f->H, &f->prio)
                   : CtRenderFieldBase(a, scene, 0, &f->W, &f->H, &f->prio);
   if (!f->base) { if (f->sd) CtFieldSceneClose(f->sd); f->sd = NULL; return 0; }
   uint32_t ln = 0;
@@ -9224,6 +9404,7 @@ static int fieldStickChord(const SDL_Event* e) {
 }
 // The F1 overlay, modal: draws the paused picture and the options until the player closes them; 1 = leave the game.
 static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
+  CtPresentSetAsync(pr, 0);                          // the overlay draws on this thread: wait for the render thread, take the renderer back
   if (dev) SDL_PauseAudioDevice(dev, 1);
   int open = 1, quit = 0;
   while (open) {
@@ -9247,11 +9428,18 @@ static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
   }
   CtSettingsSave();
   g_hostT0 = -1.0; g_hostFrames = 0;                 // the pause is not a stall to catch up on
+  g_paceLastExit = -1.0;                             // ...nor a frame's work, for the stats
+  CtStatsClockReset();
+  CtPresentSetAsync(pr, 1);                          // (and the render thread again)
   if (dev) { SDL_ClearQueuedAudio(dev); SDL_PauseAudioDevice(dev, 0); }
   return quit;
 }
 
 int main(int argc, char** argv) {
+  CtAudioClockHook = CtStatsNow;                  // (hoststats: the handshakes are timed)
+  CtSwitchInit(&argc, &argv);                    // (the Switch host only: the folder, the log, the default arguments)
+  CtSceneSetParallel(CtParallelFor);             // (the host pool: serial unless CT_THREADS / the Switch says otherwise)
+  CtSwitchTrace("main");
   dbgInit();                                     // cache the debug env flags (hot loops read dbg.*)
   // A PLAYER: one frame of SPC per displayed frame, so a translated stage's holds do not run the APU (snes.c, the
   // switch's note: the race's holds left the demo's sound 1.8 s behind). CT_XLAT_HOLDAPU=1 keeps the oracle's way.
@@ -10251,7 +10439,7 @@ int main(int argc, char** argv) {
         }
       }
       int nw = 0, nh = 0; uint8_t* nprio = NULL;
-      uint8_t* nb = CtFieldSceneBake(f.sd, &nw, &nh, &nprio);
+      uint8_t* nb = hostSceneBake(f.sd, &nw, &nh, &nprio);
       if (nb) { free(f.base); free(f.prio); f.base = nb; f.prio = nprio; f.W = nw; f.H = nh; }
       CtFieldSceneDumpTiles(f.sd, 23, 5, 27, 11);
     }
@@ -10389,7 +10577,7 @@ int main(int argc, char** argv) {
     // has checked it survives a battle.)
     if (f.sd && fieldTileAnimSeedShown(f.sd, CtSceneMem7E(f.vm))) {
       int nw = 0, nh = 0; uint8_t* nprio = NULL;
-      uint8_t* nb = CtFieldSceneBake(f.sd, &nw, &nh, &nprio);
+      uint8_t* nb = hostSceneBake(f.sd, &nw, &nh, &nprio);
       if (nb) { free(f.base); free(f.prio); f.base = nb; f.prio = nprio; f.W = nw; f.H = nh; } else free(nprio);
     }
   }
@@ -10785,7 +10973,8 @@ int main(int argc, char** argv) {
   if (g_hostInteractive) {                             // the picture is placed by hostDstRect, the overlay on top
     hostApplyVideo(pr);
     fprintf(stderr, "[video] %s\n", CtPresentName(pr));
-    if (CtOverlayInit(pr)) fprintf(stderr, "[options] F1: options (%s)\n", CtSettingsPath());
+    if (CtOverlayInit(pr)) fprintf(stderr, "[options] F1 or L3+R3: options (%s)\n", CtSettingsPath());
+    CtPresentSetAsync(pr, 1);                        // (the render thread: only where present.c allows it -- the Switch, or CT_ASYNC_PRESENT=1)
   }
 
   uint8_t* fb = (uint8_t*)calloc((size_t)CAMW * CAMH * 3, 1);   // zeroed: the pre-first-compose frame
@@ -11201,12 +11390,18 @@ int main(int argc, char** argv) {
     if (optionsReq && fieldOptionsModal(pr, audioDev)) running = 0;
     // CT_OVERLAY_SHOT=<out.bmp>[@frame][:tab] (probe): at that frame (default 60) draw the overlay over the picture on
     // tab 0..3, save the window as a BMP and leave -- how the overlay is checked headless (SDL_VIDEODRIVER=dummy).
+    { static int tg = -1; if (tg < 0) tg = getenv("CT_ASYNC_TOGGLE_TEST") != NULL;   // (check) the render thread handed back and forth, as the options menu does
+      if (tg && CtOverlayAvailable() && frameNo > 60 && frameNo % 90 == 0) {
+        CtPresentSetAsync(pr, 0);
+        for (int i = 0; i < 2; i++) { CtOverlayFrame(); hostDrawPicture(pr); CtOverlayRender(); CtPresentSwap(pr); }
+        CtPresentSetAsync(pr, 1); } }
     { const char* os = getenv("CT_OVERLAY_SHOT");
       if (os && CtOverlayAvailable()) {
         char path[512]; snprintf(path, sizeof path, "%s", os);
         int at = 60, tab = 0; char* q = strrchr(path, ':'); if (q && q > path + 1) { tab = atoi(q + 1); *q = 0; }
         q = strrchr(path, '@'); if (q) { at = atoi(q + 1); *q = 0; }
         if (frameNo == at) {
+          CtPresentSetAsync(pr, 0);                       // (the probe draws on this thread)
           if (g_lastShown) hostUploadPictureAt(pr, g_lastShown, g_lastShownW, 256, 0); else hostUploadPicture(pr, fb);
           if (tab == 9) hostDrawPicture(pr);             // (:9 -- the picture alone, no overlay)
           else for (int i = 0; i < 3; i++) { CtOverlaySelectTab(tab); CtOverlayFrame(); hostDrawPicture(pr); CtOverlayRender(); }
@@ -11482,7 +11677,8 @@ int main(int argc, char** argv) {
           fieldFree(&f);
           coldResetHold = 0;                          // a location is being loaded: C0/0097 runs again after it
           g_ctLzSpriteCycles = 0;                     // ...and this load's object pass owns the sprite decompressions
-          if (!fieldLoad(&assets, &f, pendDest, gm)) running = 0;
+          double stLd = CtStatsNow(); int ldOk = fieldLoad(&assets, &f, pendDest, gm); CtStatsPresent(CT_ST_XLOAD, CtStatsNow() - stLd);
+          if (!ldOk) running = 0;
           else {
             noPcShot = -1;              // a RELOAD re-arms the no-PC grade below: the New Game
                                         //   reboot re-enters the SAME scene 0, and the window the
@@ -12570,6 +12766,7 @@ int main(int argc, char** argv) {
           for (int q = 0; q < n && q < 8; q++) { CtWorldAnimPiece(B, q, &dx, &dy, &nm, &fl); g_owPlacardName[g_owPlacardN++] = nm; }
           g_owPlacardDx = -owWideX;
         }
+      CtStatsMark(0);                                 // (hoststats: the overworld frame's logic is done, its picture is built from here)
       CtMotFrame* owMot = &g_motBuf[g_motIdx];
       CtMotBegin(owMot, owWideW); g_motViewX = owWideX;
       { const CtWorldCam* cs = wd.haveShow ? &wd.camShow : &wd.cam;
@@ -12586,7 +12783,11 @@ int main(int argc, char** argv) {
           memcpy(g_motPic, g_wfb, (size_t)owWideW * CAMH * 3);
         } }
       if (owWideW == CAMW) { g_mot = owMot; g_owNatRec = &g_owNat[g_motIdx]; }
-      worldCompose(&wd, fb);
+      static int owRecompose = -1; if (owRecompose < 0) owRecompose = getenv("CT_OW_RECOMPOSE") != NULL;
+      if (owWideW > CAMW && !owRecompose) {   // the widescreen: the 256 view is the wide frame's centre (CT_OW_RECOMPOSE=1: compose it again, as before)
+        for (int y = 0; y < CAMH; y++) memcpy(fb + (size_t)y * CAMW * 3, g_wfb + ((size_t)y * owWideW + owWideX) * 3, (size_t)CAMW * 3);
+        worldPoseAdvance(&wd);
+      } else worldCompose(&wd, fb);
       g_mot = NULL; g_owNatRec = NULL;
       if (owWideW == CAMW) memcpy(g_motPic, fb, (size_t)CAMW * CAMH * 3);
       owMot->valid = wd.wram != NULL && !owLoading;
@@ -12762,6 +12963,7 @@ int main(int argc, char** argv) {
                     fwrite(wd.stm.tilemap, sizeof(wd.stm.tilemap[0][0]), sizeof(wd.stm.tilemap) / sizeof(wd.stm.tilemap[0][0]), df);
                     fwrite(cw, sizeof cw[0], 6, df); fclose(df);
                     printf("owdump: f%d -> %s (tilemap words %u)\n", frameNo, odPath, (unsigned)(sizeof(wd.stm.tilemap) / sizeof(wd.stm.tilemap[0][0]))); } } }
+      CtStatsMark(1);
       { const uint8_t* shown = fb; int shownW = CAMW;
         if (owWideW > CAMW) {                        // the widescreen's sides around the finished view
           fieldWideAssemble(g_wide, g_wfb, fb, owWideW, owWideX, owWideX, owBri, 0, owMot);
@@ -12769,6 +12971,7 @@ int main(int argc, char** argv) {
         }
         if (owMot->valid) CtMotSettle(owMot, g_motPic, shown, owBri);
         hostPresentMot(pr, shown, shownW, owMot->valid); }
+      CtStatsContext("OW", CtWramSys(fieldWram())[0x100] | (CtWramSys(fieldWram())[0x101] << 8));
       if (!selftest && !g_noPace) hostPace();       // the host clock (top of file): frame k due at T0 + k/60 s
       if (menuPhase == 1 || menuPhase == 3) {       // the overworld's own 17-frame menu fade clock
         menuT++;                                     // (C2/252F / C2/257F `LDX #0011`)
@@ -15326,6 +15529,7 @@ int main(int argc, char** argv) {
       }
       presentShot(fb, CAMW, CAMH, frameNo, (CtWramSys(fieldWram())[0x100] | (CtWramSys(fieldWram())[0x101] << 8)), "menu");
       hostPresentMot(pr, fb, CAMW, 0);
+      CtStatsContext("MENU", CtWramSys(fieldWram())[0x100] | (CtWramSys(fieldWram())[0x101] << 8));
       if (!selftest && !g_noPace) hostPace();
       fieldByteWatch(frameNo); frameNo++; g_sndTraceFrame = frameNo;
       if (selftest && frameNo >= selftestFrames) {           // safety: a stuck menu must not spin forever
@@ -16764,7 +16968,7 @@ int main(int argc, char** argv) {
     }
     else if (!battlePhase && !inWorld && f.vm && !loadFadeEntry && fade != 3 && !coldResetHold && !fieldResume &&
         CtSceneSequence(f.vm) < 0 && !rebootReq && ffPro != 1 && ffPro != 2)   // (op 0xFF's own fade: the scheduler is
-        CtSceneTick(f.vm);   // the event VM: FROZEN in battle AND on the overworld      //  inside its visit)
+        { double stVm = CtStatsNow(); CtSceneTick(f.vm); CtStatsPresent(CT_ST_XVM, CtStatsNow() - stVm); }   // the event VM: FROZEN in battle AND on the overworld      //  inside its visit)
     // THE SCRIPTED LEAD IS DRAWN WHERE THIS FRAME'S C0/A810 PUT HIM. The follow above (the lead's position while the script
     // drives him) read the VM before its tick, i.e. the previous frame's commit, and the lead is drawn from px/py -- one
     // frame behind every other object, whose sprite the drain builds after A810 in the same frame (C0/00D3 A810, C0/00D6
@@ -16963,7 +17167,7 @@ int main(int argc, char** argv) {
             battleResolved = 1;                              // post-victory RETURN probe marker (STEP 6 check)
           }
         } else if (battleExitPoll ? (CtBattleTailFrame(&liveHost), CtBattleExitPoll(&liveHost))   // CD/042B-0438
-                                  : (CtBattleTick(&liveHost, battleEndReq, binp) && (battleExitPoll = 1) && 0)) {
+                                  : (hostBattleTick(&liveHost, battleEndReq, binp) && (battleExitPoll = 1) && 0)) {
           // The module's last frame (CD/0418-0428) hands over to CD/044A's waits: from the next frame D1/F4C0 is the NMI
           // (CtBattleTailFrame) and the poll runs after it; on the frame it lets go, CD/043E `JSL C0/000B` -- the chain.
           battleExitPoll = 0;
@@ -17047,7 +17251,9 @@ int main(int argc, char** argv) {
         }
       } else {
         int entered = 0;                                 // the detect+staging path; interactive -> enters battle mode
-        fieldBattleConsumer(f.vm, !selftest, &liveHost, &ran, &gameOver, &entered);
+        { double stEn = CtStatsNow(); CtBattleLapHook = hostBattleLap;
+          fieldBattleConsumer(f.vm, !selftest, &liveHost, &ran, &gameOver, &entered);
+          if (entered) CtStatsPresent(CT_ST_XENTER, CtStatsNow() - stEn); }
         if (entered) {                                   // that frame composes the freshly-staged field (no VM tick interposed)
           // ENTRY CUT (battle_stance.md ADDENDUM 7, T3a): the field->battle position change is an
           // INSTANTANEOUS CUT, not a walk/slide -- Crono's cluster is at the battle-staging position from
@@ -17416,8 +17622,9 @@ int main(int argc, char** argv) {
       }
       if (dirty) {
         int nw = 0, nh = 0; uint8_t* nprio = NULL;
-        uint8_t* nb = CtFieldSceneBake(f.sd, &nw, &nh, &nprio);
-        if (nb) { free(f.base); free(f.prio); f.base = nb; f.prio = nprio; f.W = nw; f.H = nh; }
+        hostBakeWindow(&f, battlePhase);
+        uint8_t* nb = hostSceneBakeWin(f.sd, &nw, &nh, &nprio);
+        if (nb) hostAdoptBake(&f, nb, nprio, nw, nh);
       }
     }
     { const char* da = dbg.dumpMapAt;                  // probe: live post-copy base dump
@@ -17517,10 +17724,11 @@ int main(int argc, char** argv) {
     // (C0/EB2F `CMP #04` -> C0/7F62), so BG3's tilemap is the map's again; while the plane holds, the bake leaves BG3 out.
     if (fieldNmi && f.vm && CtSceneMem7E(f.vm)[0x0146] == 4) g_bg3Plane = 0;
     if (f.sd) bgDirty |= CtFieldSceneSetVramLayers(f.sd, (g_bg3Plane && !battlePhase) ? 0x04 : 0);
+    if (f.sd) { hostBakeWindow(&f, battlePhase); if (!CtFieldSceneBakeCovers(f.sd)) bgDirty = 1; }   // (the camera left the baked rectangle: a windowed bake)
     if (f.sd && bgDirty) {
       int nw = 0, nh = 0; uint8_t* nprio = NULL;
-      uint8_t* nb = CtFieldSceneBake(f.sd, &nw, &nh, &nprio);
-      if (nb) { free(f.base); free(f.prio); f.base = nb; f.prio = nprio; f.W = nw; f.H = nh; }
+      uint8_t* nb = hostSceneBakeWin(f.sd, &nw, &nh, &nprio);
+      if (nb) hostAdoptBake(&f, nb, nprio, nw, nh);
       else free(nprio);
     }
 
@@ -17586,6 +17794,7 @@ int main(int argc, char** argv) {
     g_fw = wideW; g_fx = wideX;
     int cw = wideW, ch = CAMH;
     CtMotFrame* mot = &g_motBuf[g_motIdx];           // the picture's owners, recorded as it is drawn (motion.h)
+    CtStatsMark(0);                                   // (hoststats: the field frame's logic is done, its picture is built from here)
     CtMotBegin(mot, wideW); g_mot = mot; g_motOwn = CT_MOT_FIXED; g_motViewX = wideX;
     mot->scene = CtWramSys(fieldWram())[0x100] | (CtWramSys(fieldWram())[0x101] << 8);
     mot->camX = camx; mot->camY = camy; mot->canvas = f.base; mot->cW = f.W; mot->cH = f.H;
@@ -17684,7 +17893,7 @@ int main(int argc, char** argv) {
     fieldHdmaTmRows((f.vm && !battlePhase) ? CtWramSys(fieldWram()) : NULL);   // the box text's BG3 lines (drawTbSlots)
     if (g_bgWinOn && f.sd) {
       int bw = 0, bh = 0;
-      uint8_t* b3 = CtFieldSceneBakeLayersOff(f.sd, 0x03, &bw, &bh);
+      uint8_t* b3 = hostSceneBakeB3(f.sd, 0x03, &bw, &bh);
       if (b3 && bw == f.W && bh == f.H)
         for (int y = 0; y < ch; y++)
           for (int x = g_bgWinL[y] + g_fx; x <= g_bgWinR[y] + g_fx && x < cw; x++) {
@@ -18234,7 +18443,7 @@ int main(int argc, char** argv) {
       int wm0, wm1; fieldWideMask(&f, wideW, &wm0, &wm1);
       static CtSceneLayers beyondL; int det = 0;     // (past the edge: the layers scrolling on their own -- fieldBeyondPixel)
       if (wm0 > -(1 << 29) && f.sd && (det = fieldBeyondLayers(mot->o2x, mot->o2y, mot->o3x, mot->o3y)) != 0 &&
-          !CtFieldSceneLayers(f.sd, &beyondL)) det = 0;
+          !hostSceneLayers(f.sd, &beyondL)) det = 0;
       g_wideBeyond = det;
       for (int y = 0; y < ch; y++)
         for (int x = 0; x < wideW; x++) {
@@ -18259,7 +18468,7 @@ int main(int argc, char** argv) {
     // the frames between natively (fieldnative.c): the map's layers, when nothing the native drawer leaves out is up --
     // the caption plane, the iris window, the colour window
     { static CtSceneLayers motLayers[2]; static CtFieldNativeFx motFx[2];
-      if (mot->valid && (hostInterp(pr) || getenv("CT_NATIVECHECK")) && CtFieldSceneLayers(f.sd, &motLayers[g_motIdx])) {
+      if (mot->valid && (hostInterp(pr) || getenv("CT_NATIVECHECK")) && hostSceneLayers(f.sd, &motLayers[g_motIdx])) {
         mot->native = &motLayers[g_motIdx];
         motLayers[g_motIdx].beyond = wideW > CAMW ? g_wideBeyond : 0;
         if (bg3Plane || g_bgWinOn || g_colWinOn) {     // ...and what is composed over them: the iris, the colour window, the captions
@@ -18414,10 +18623,12 @@ int main(int argc, char** argv) {
               int sx = camx + x, sy = camy + y;
               cvwin[y * CAMW + x] = (sx >= 0 && sy >= 0 && sx < cvW && sy < cvH) ? cvs[(size_t)sy * cvW + sx] : 0;
             }
+          CtStatsLap(CT_ST_LBASE);                          // (the base layers, up to here)
           CtBattleFxLayerCompose(fb, CAMW, CAMH, cvwin, bmem, &liveHost);   // BG3 through the windows + colour math
           memcpy(fxFrontFb, fb, sizeof fxFrontFb); fxFrontOn = 1;   // BG3's priority pixels come back after the sprites
         } }
       battleCritFlashRender(fb, &liveHost);          // battle_crit.md §C: BG->white crit flash (BEFORE sprites)
+      CtStatsLap(CT_ST_LFX);                           // (the 256 view's effect layer + the crit flash)
       { int bwW = battlePhase ? hostWideW() : CAMW;   // THE WIDESCREEN'S ARENA (g_bwFb above)
         int cvW = 0, cvH = 0; const uint8_t* cvs = f.sd ? CtFieldSceneCoverage(f.sd, &cvW, &cvH) : NULL;
         if (bwW > CAMW && bwW <= FIELD_WMAX && f.base) {
@@ -18434,7 +18645,7 @@ int main(int argc, char** argv) {
           static uint8_t bcov[FIELD_WMAX * CAMH];
           static CtSceneLayers bBeyondL; int bdet = 0;
           if (bwm0 > -(1 << 29) && f.sd && (bdet = fieldBeyondLayers(mot->o2x, mot->o2y, mot->o3x, mot->o3y)) != 0 &&
-              !CtFieldSceneLayers(f.sd, &bBeyondL)) bdet = 0;
+              !hostSceneLayers(f.sd, &bBeyondL)) bdet = 0;
           // The row's battle scroll (the shake, a line wave). The HUD band's rows carry no arena records (arenaRow != 3: the
           // view's HUD covers them), but their sides are the arena: they take the nearest arena row's, towards the screen's
           // middle first -- as their colour math does (btFxCompose's band rows) -- so the sides beside the HUD shake with the rest.
@@ -18449,19 +18660,9 @@ int main(int argc, char** argv) {
             bwD[y * 2] = arenaD[src * 4]; bwD[y * 2 + 1] = arenaD[src * 4 + 1];
             g_bwBand[y] = (uint8_t)(src != y);
           }
-          for (int y = 0; y < CAMH; y++)
-            for (int x = 0; x < bwW; x++) {
-              int ux = camx - bx0 + x, sy = camy + y; size_t i = (size_t)y * bwW + x;
-              int ax = ux + bwD[y * 2], ay = sy + bwD[y * 2 + 1];   // (the map moves under the room's edge with the shake)
-              if (ax < bwm0 || ax >= bwm1) {             // the room's end (its self-scrolling layers go on: fieldBeyondPixel)
-                if (bdet) fieldBeyondPixel(&bBeyondL, bdet, ax, ay, mot->o2x, mot->o2y, mot->o3x, mot->o3y, g_bwFb + i * 3);
-                else memset(g_bwFb + i * 3, 0, 3);
-                bcov[i] = 0; continue; }
-              memcpy(g_bwFb + i * 3, f.base + fieldBaseAt(&f, ax, ay) * 3, 3);
-              // (the arena's layer there, wrapping as the map does -- past a room as wide as its map is the map again)
-              //  (unshifted by the row's battle scroll, as the view's own lookup above)
-              bcov[i] = (cvs && cvW > 0 && cvH > 0) ? cvs[(size_t)((sy % cvH + cvH) % cvH) * cvW + (size_t)((ux % cvW + cvW) % cvW)] : 0;
-            }
+          double stA0 = CtStatsNow();
+          { BwArena ba = { &f, &bBeyondL, bdet, bwW, camx, camy, bx0, bwm0, bwm1, bwD, mot->o2x, mot->o2y, mot->o3x, mot->o3y, cvs, cvW, cvH, bcov };
+            CtParallelFor(CAMH, 16, bwArenaRows, &ba); }
           int mz = bmem[0xBE9A], msz = (mz >> 4) + 1;  // the flee's mosaic, on the view's own block grid
           if (msz > 1 && (mz & 0x0F))
             for (int by = 0; by < CAMH; by += msz)
@@ -18471,11 +18672,15 @@ int main(int argc, char** argv) {
                 for (int y = by; y < by + msz && y < CAMH; y++)
                   for (int x = bx + bx0; x < bx + bx0 + msz && x < bwW; x++) if (x >= 0) memcpy(g_bwFb + ((size_t)y * bwW + x) * 3, c, 3);
               }
+          CtStatsPresent(CT_ST_BWARENA, CtStatsNow() - stA0);                  // (the arena: its pixels + the flee mosaic)
+          double stF0 = CtStatsNow();
           if (cvs) CtBattleFxLayerComposeWide(g_bwFb, bwW, CAMH, bcov, bmem, &liveHost, bx0);
           battleCritFlashRenderN(g_bwFb, (size_t)bwW * CAMH, &liveHost);
+          CtStatsPresent(CT_ST_BWFX, CtStatsNow() - stF0);                     // (the effect layer + the crit flash)
           memcpy(g_bwPre, g_bwFb, (size_t)bwW * CAMH * 3);
           g_bwW = bwW; g_bwX = bx0;
         } }
+      CtStatsLap(CT_ST_LWIDE);                         // (the widescreen arena, all of it)
       // Z-ORDER: the combatants are drawn in the ROM's own OAM order -- a per-frame DESCENDING sort by
       // screen Y ($1D23+cmb), PCs and enemies INTERLEAVED (battleObjOrder/battleCombatantsRender, the
       // CF/E83F derivation). The old fixed stack ('every enemy, then every PC') made a PC win every
@@ -18498,6 +18703,7 @@ int main(int argc, char** argv) {
         g_mot = mot;
       }
       battleCombatantsRender(fb, bmem, &liveHost);
+      CtStatsLap(CT_ST_LCMB);                          // (the combatants)
       if (bMot) { g_mot = NULL; g_motOwn = CT_MOT_FIXED; memcpy(g_motPic, fb, (size_t)CAMW * CAMH * 3); mot->valid = 1; }
       const int bPop0 = bMot ? mot->nspr : 0;         // (the popups' objects follow the combatants')
       g_bObjPrioMask = NULL;
@@ -18574,6 +18780,7 @@ int main(int argc, char** argv) {
       uint8_t* bpre = getenv("CT_BATTLESHOT_FIELD") ? (uint8_t*)malloc((size_t)CAMW * CAMH * 3) : NULL;
       if (bpre) memcpy(bpre, fb, (size_t)CAMW * CAMH * 3);
       CtBattleHudRender(fb, bs2, CtBattleStripVram(&liveHost));
+      CtStatsLap(CT_ST_LHUD);
       if (bpre) {
         int bt = -1, bb2 = -1;
         for (int y = 0; y < CAMH; y++)
@@ -18698,6 +18905,7 @@ int main(int argc, char** argv) {
         // last NMI upload left it in VRAM (CtBattleStripVram) -- C0/0905 has already put the field's object page,
         // $0B40 among it, back in WRAM (fieldBattleFinish), which VRAM does not see.
         CtBattleHudRender(fb, bs3, CtBattleStripVram(&liveHost));
+        CtStatsLap(CT_ST_LHUD);
         FILE* of = fopen(bsp, "wb");
         if (of) { uint32_t wh[2] = { (uint32_t)CAMW, (uint32_t)CAMH };
                   fwrite(wh, 4, 2, of); fwrite(fb, (size_t)CAMW * CAMH * 3, 1, of); fclose(of); }
@@ -18862,59 +19070,23 @@ int main(int argc, char** argv) {
         shown = g_wide; shownW = g_seqWideW;
       } else if (g_bwW > CAMW && battlePhase && !gwX && !(seqId >= 0 && seqOpen != 0)) {   // the widescreen battle: the
         const int bbr = (battleInidisp & 0x80) ? 0 : (battleInidisp & 0x0F);                     //   arena's sides round the view
-        for (int y = 0; y < CAMH; y++) {
-          memcpy(g_wide + (size_t)y * g_bwW * 3, g_bwFb + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
-          if (g_bwX == g_bwXc) { memcpy(g_wide + ((size_t)y * g_bwW + g_bwX) * 3, fb + (size_t)y * CAMW * 3, (size_t)CAMW * 3); continue; }
-          // (the camera stopped at the room's edge: the world -- the arena, the fighters -- where it stands, the boxes and
-          //  the HUD at the middle; under a box the world is the view before the boxes)
-          // (the HUD band's rows: the view drew its arena there unmoved -- the HUD covers it in the 256 picture -- but beside
-          //  the HUD it shows, so where nothing was drawn over that arena (the world still the canvas before the combatants)
-          //  the world is the wide arena's, which moves with the shake: g_bwBand)
-          const uint8_t* v = fb + (size_t)y * CAMW * 3; const uint8_t* wv = g_bWorld + (size_t)y * CAMW * 3;
-          const uint8_t* cv = g_bMotCanvas + (size_t)y * CAMW * 3; const uint8_t* av = g_bwPre + ((size_t)y * g_bwW + g_bwX) * 3;
-          for (int vx = 0; vx < CAMW; vx++) {
-            const uint8_t* wp = (g_bwBand[y] && !memcmp(wv + vx * 3, cv + vx * 3, 3)) ? av + vx * 3 : wv + vx * 3;
-            uint8_t e[3]; for (int c = 0; c < 3; c++) e[c] = (uint8_t)(bbr >= 15 ? wp[c] : bbr <= 0 ? 0 : wp[c] * bbr / 15);
-            memcpy(g_wide + ((size_t)y * g_bwW + g_bwX + vx) * 3, e, 3);
-          }
-          for (int vx = 0; vx < CAMW; vx++) {               // (the view's pixel that is its world's stays the world's above)
-            const uint8_t* wp = wv + vx * 3; int same = 1;
-            for (int c = 0; c < 3; c++) { int e = bbr >= 15 ? wp[c] : bbr <= 0 ? 0 : wp[c] * bbr / 15; if (e != v[vx * 3 + c]) same = 0; }
-            if (!same) memcpy(g_wide + ((size_t)y * g_bwW + g_bwXc + vx) * 3, v + vx * 3, 3);
-          }
-        }
+        { BwAsmA ja = { fb, bbr }; CtParallelFor(CAMH, 8, bwAsmRowsA, &ja); }
         shown = g_wide; shownW = g_bwW;
         if (fieldBlank) memset(g_wide + (size_t)211 * g_bwW * 3, 0, (size_t)(CAMH - 211) * g_bwW * 3);   // (the IRQ's blank lines)
         if (mot->valid && mot->w == CAMW && g_bwW <= CT_MOT_W) {   // ...and its owners, as wide: the sides are the arena
-          static uint8_t bwCanvas[FIELD_WMAX * CAMH * 3], ownV[CAMW * CAMH];
-          memcpy(ownV, mot->own, sizeof ownV);
-          for (int y = 0; y < CAMH; y++) {
-            memcpy(bwCanvas + (size_t)y * g_bwW * 3, g_bwPre + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
-            if (!(g_bwBand[y] && g_bwX != g_bwXc))         // (the HUD band beside a stopped camera: the wide arena's, as shown)
-              memcpy(bwCanvas + ((size_t)y * g_bwW + g_bwX) * 3, g_bMotCanvas + (size_t)y * CAMW * 3, (size_t)CAMW * 3);
-          }
-          static uint8_t picV[CAMW * CAMH * 3]; memcpy(picV, g_motPic, sizeof picV);
-          for (int y = 0; y < CAMH; y++) {
-            memcpy(g_motPic + (size_t)y * g_bwW * 3, g_bwPre + (size_t)y * g_bwW * 3, (size_t)g_bwW * 3);
-            const int band = g_bwBand[y] && g_bwX != g_bwXc;
-            for (int vx = 0; vx < CAMW; vx++) {
-              const uint8_t* p = picV + ((size_t)y * CAMW + vx) * 3;
-              if (band && !memcmp(p, g_bMotCanvas + ((size_t)y * CAMW + vx) * 3, 3)) continue;
-              memcpy(g_motPic + ((size_t)y * g_bwW + g_bwX + vx) * 3, p, 3);
-            }
-          }
+          memcpy(g_bwOwnV, mot->own, sizeof g_bwOwnV);
+          memcpy(g_bwPicV, g_motPic, sizeof g_bwPicV);
+          { BwAsmB jb = { mot }; CtParallelFor(CAMH, 8, bwAsmRowsB, &jb); }
           mot->w = g_bwW;
-          for (int y = 0; y < CAMH; y++)
-            for (int x = 0; x < g_bwW; x++) {
-              int xv = x - g_bwX;
-              mot->own[y * g_bwW + x] = (xv >= 0 && xv < CAMW) ? ownV[y * CAMW + xv] : (uint8_t)CT_MOT_BG1;
-            }
           for (int i = 0; i < mot->nspx; i++) mot->spx[i].x = (int16_t)(mot->spx[i].x + g_bwX);
-          mot->canvas = bwCanvas; mot->cW = g_bwW; mot->cH = CAMH;
+          mot->canvas = g_bwCanvas; mot->cW = g_bwW; mot->cH = CAMH;
         }
       }
+      CtStatsLap(CT_ST_LASM);                          // (the wide assembly and the rest, up to the picture)
+      CtStatsMark(1);
       if (mot->valid) CtMotSettle(mot, g_motPic, shown, motBright);
       hostPresentMot(pr, shown, shownW, mot->valid); }
+    CtStatsContext(battlePhase ? "BATTLE" : "FIELD", CtWramSys(fieldWram())[0x100] | (CtWramSys(fieldWram())[0x101] << 8));
     if (!selftest && !g_noPace) hostPace();         // the engine logic (VM delays, anim ticks, the validated px/frame
                                                     //   velocities) is all 60 Hz-based; the SPC is run by the same frames
     fieldLockGrade(frameNo);                          // close the window and grade this frame
