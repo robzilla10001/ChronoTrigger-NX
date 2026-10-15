@@ -47,7 +47,10 @@ VCVARS_REL = r"VC\Auxiliary\Build\vcvars64.bat"
 CMAKE_REL = r"Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 NINJA_REL = r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 
-KNOWN_TARGETS = ("ct", "ct_field", "ct_world", "ct_viewer")
+# The oracle always; the PC test targets only where cmake/pc_targets.cmake (local, untracked) defines them.
+KNOWN_TARGETS = ("ct",) + (("ct_field", "ct_world", "ct_viewer")
+                           if os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cmake", "pc_targets.cmake"))
+                           else ())
 SDL_H = os.path.join(ROOT, "third_party", "SDL2", "include", "SDL.h")
 
 

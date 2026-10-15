@@ -1,5 +1,10 @@
 # Infrastructure guide
 
+> **Local only.** This repository is the Nintendo Switch port. What these pages describe as the PC-side tooling (the regression suite,
+> the oracle comparators, the fixtures, the PC viewers and the `ct_field` PC target in `cmake/pc_targets.cmake`, the Windows scripts) is
+> not tracked: it stays on a developer's disk for build testing and is git-ignored (see `.gitignore`). The tracked tree builds the oracle
+> that `tools/setup.py` needs and the console build in `switch/`.
+
 How this repo is built, tested, laid out, and validated against the oracle. Companion
 references: [`DEBUG_SURFACE.md`](DEBUG_SURFACE.md) (every ct.exe CLI mode + every debug
 env var) and [`TESTING.md`](TESTING.md) (regression tiers and pinned baselines).

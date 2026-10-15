@@ -15,7 +15,8 @@ file the build needs that comes from the game (docs/ROM.md):
      (the overworld snapshots and sprite atlases, the window bitmaps: assets/extract_assets.py pack_world);
   4. assets/extract_assets.py builds ct_assets.dat (the scenes, sprites, scripts and text the engine loads);
   5. the other generators write src/data/*.h and src/xlat/*.c;
-  6. everything is built (tools/build.py).
+  6. the build is checked (tools/build.py: the oracle, and the local PC test targets where cmake/pc_targets.cmake exists);
+     the Switch NRO is built separately (README, Quick start).
 
 Each step says what it did. A generator that still needs a capture that is not a recipe yet is reported (see
 docs/ROADMAP.md) and setup exits 1 at the end if any generated file is missing.
@@ -186,7 +187,7 @@ def main():
     if missing:
         say('NOT COMPLETE: %d generated file(s) could not be made: %s (docs/ROADMAP.md)' % (len(missing), ', '.join(missing)))
         return 1
-    say('done. Play: build\\ct_field.exe --assets ct_assets.dat --boot')
+    say('done. Next: build the Switch NRO (README, Quick start, step 4)')
     return 0
 
 

@@ -112,3 +112,22 @@ tools/_*
 
 # Switch run logs (ct_log.txt, ct_stats.txt copied back from the console)
 /reports/
+
+# PC-side test tooling: LOCAL ONLY (the regression suite, the oracle comparators, fixtures, the PC viewers/targets, Windows scripts).
+# This repository is the Switch port; what the ROM -> NRO path needs (tools/setup.py, build.py, recipes.py, gen/, recipes/, ctlib/,
+# disasm65816.py, parse_ppu_state.py, get_imgui.sh) stays tracked. The files below stay on a developer's disk for build testing.
+/tools/*
+!/tools/ctlib/
+!/tools/gen/
+!/tools/recipes/
+!/tools/build.py
+!/tools/disasm65816.py
+!/tools/get_imgui.sh
+!/tools/parse_ppu_state.py
+!/tools/recipes.py
+!/tools/setup.py
+/cmake/
+/src/ct_world.c
+/src/overlay_stub.c
+/src/present_vk.c
+/src/viewer.c

@@ -1,5 +1,10 @@
 # TESTING — the one-command regression suite
 
+> **Local only.** This repository is the Nintendo Switch port. What these pages describe as the PC-side tooling (the regression suite,
+> the oracle comparators, the fixtures, the PC viewers and the `ct_field` PC target in `cmake/pc_targets.cmake`, the Windows scripts) is
+> not tracked: it stays on a developer's disk for build testing and is git-ignored (see `.gitignore`). The tracked tree builds the oracle
+> that `tools/setup.py` needs and the console build in `switch/`.
+
 ```
 python tools/regress.py               # full suite, 4 parallel jobs
 python tools/regress.py --quick       # tier "quick" only
