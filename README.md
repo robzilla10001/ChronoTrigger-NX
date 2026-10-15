@@ -58,9 +58,9 @@ With the widescreen mod (16:9), the field, the overworld and battles show more o
 | ![A floating continent over the clouds, widescreen](docs/media/widescreen-zeal.png) | ![A battle on a bridge, widescreen](docs/media/widescreen-battle.png) |
 | ![The party in a forest, widescreen](docs/media/widescreen-forest.png) | ![The party before a castle gate, widescreen](docs/media/widescreen-castle.png) |
 
-The mods are switched on in the F1 overlay. With every option at its default, the game is the vanilla game:
+The mods are switched on in the mods menu (**L3 + R3** on the console). With every option at its default, the game is the vanilla game:
 
-<p align="center"><img src="docs/media/options-overlay.png" alt="The F1 options overlay, Video tab" width="796"></p>
+<p align="center"><img src="docs/media/options-overlay.png" alt="The mods menu, Video tab" width="796"></p>
 
 ## Status
 
@@ -77,7 +77,7 @@ It is **not yet verified playable from start to finish**.
 | Overworld | Works | Camera and tilemap streaming, the ambient-object VM (birds, boats), the ferry, party followers, zoned music. |
 | Sound | Works, with debt | The bank `$C7` driver upload, the song loader, the command channel. The SPC700 itself still runs on LakeSnes's SPC700/DSP core (see [Not done](#not-done)). |
 | Title and attract | Works | The title sequence is the overlay's own machine; the attract demo is audited against the cartridge frame by frame. |
-| Mods (F1) | Works | Widescreen, internal resolution, frames between (60+ fps), free sync. Opt-in; with every option at its default the game is the vanilla game. |
+| Mods menu | Works | Widescreen, internal resolution, frames between (60+ fps), free sync. Opt-in; with every option at its default the game is the vanilla game. |
 
 ### Not done
 
@@ -96,6 +96,75 @@ It is **not yet verified playable from start to finish**.
 
 ## Quick start
 
-### Requirements
+This takes you from a clone and your own ROM dump to a `ct_field.nro` for a Nintendo Switch with custom firmware,
+using Docker for the toolchain. Nothing from the game is in the repository, so step 2 makes every file that comes
+from it, on your machine.
 
-> *In progress*
+You need:
+
+- **Your own dump of Chrono Trigger (USA)**, see the legal notice above. A 4 MiB file, or one with a 512-byte copier
+  header, whose SHA-1 is `de5822f4f2f7a55acb8926d4c0eaa63d5d989312`.
+- **Docker.** The toolchain is the [`devkitpro/devkita64`](https://hub.docker.com/r/devkitpro/devkita64) image
+  (devkitA64, libnx, switch-sdl2, switch-mesa and CMake), which also has the GCC and Python 3 that step 2 uses.
+- `git`, `curl` and `unzip` on the host.
+
+### 1. Get the sources
+
+```sh
+git clone https://github.com/robzilla10001/ChronoTrigger-NX.git
+cd ChronoTrigger-NX
+cp "/path/to/Chrono Trigger (USA).sfc" ./rom.sfc      # your dump; any file name will do
+docker pull devkitpro/devkita64
+```
+
+### 2. Extract the assets from the ROM
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work devkitpro/devkita64 \
+    python3 tools/setup.py --rom rom.sfc --no-build
+```
+
+This verifies the dump (size and SHA-1; a copier header is stripped), builds the reference emulator core the
+generators capture from, and writes, in the repository folder:
+
+| File | What it is |
+|---|---|
+| `ct_assets.dat` | the scenes, sprites, scripts, text and overworld the engine loads |
+| `Chrono_Trigger_USA_SNES.sfc` | the verified copy of your dump (battles and the sound driver read it at run time) |
+| `src/data/*.h`, `src/xlat/*.c` | tables and translated stages the build compiles in |
+
+It takes about ten minutes. All of it is ignored by git and none of it should ever be committed or shared.
+
+### 3. Fetch Dear ImGui (the mods menu)
+
+```sh
+sh tools/get_imgui.sh
+```
+
+This downloads Dear ImGui 1.91.5 (MIT) into `third_party/imgui`. It is only needed for the mods menu (widescreen,
+internal resolution, clock profile, performance HUD); without it the NRO still builds, minus that menu.
+
+### 4. Build the NRO
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work devkitpro/devkita64 bash -c \
+    'cmake -S switch -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake && cmake --build build-switch -j'
+```
+
+The first build takes about nine minutes. The result is `build-switch/ct_field.nro` (about 11 MB).
+
+### 5. Install it on the console
+
+Make a folder on the SD card, `sdmc:/switch/ChronoTrigger-NX/`, and copy three files into it:
+
+| File | From |
+|---|---|
+| `ct_field.nro` | `build-switch/` |
+| `ct_assets.dat` | the repository folder |
+| `Chrono_Trigger_USA_SNES.sfc` | the repository folder |
+
+Start it from the Homebrew Menu in **application mode** (hold **R** while launching a game, then pick it), for the
+full memory and CPU budget. The save (`ct_sram.srm`), `ct_settings.ini` and the log appear in the same folder.
+**L3 + R3** (press both sticks) opens the mods menu, including the Switch's clock profile; the defaults give the
+vanilla game at 256x224. For the controls, the clock profiles, the performance HUD and the report files see
+[docs/SWITCH.md](docs/SWITCH.md).

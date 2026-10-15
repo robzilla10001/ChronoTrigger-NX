@@ -37,8 +37,8 @@ the bundled CMake/Ninja, configure + compile into `build\`. Targets (from
 Rule of thumb inherited from those traps: after any build, trust the **artifact check**,
 never the banner.
 
-**Linux (gcc/clang) — a compile check, not the reference build.** `tools/build.py` is
-Windows-only, but plain CMake builds all four targets on Linux: install `libsdl2-dev`
+**Linux (gcc/clang) — a compile check, not the reference build.** `python3 tools/build.py`
+also runs there (plain CMake, then it links the `.exe`-named binaries below), and plain CMake builds all four targets: install `libsdl2-dev`
 (the SDL2 targets fall back to the system SDL2 when `third_party/SDL2` is absent), then
 `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build -j`.
 The binaries have no `.exe` suffix; `regress_checks.json` calls `build/ct*.exe`, so link

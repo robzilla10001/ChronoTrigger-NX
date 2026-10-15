@@ -6,22 +6,25 @@ A homebrew `.nro` of `ct_field` (the interactive engine), built with devkitA64 +
 
 ## Build
 
-1. `python tools/setup.py --rom <your dump>` (generates `src/data`, `src/xlat`, `ct_assets.dat`; the ROM is yours, nothing is distributed).
-2. With devkitPro (`DEVKITPRO` set; packages libnx, switch-sdl2, switch-mesa):
+The step-by-step version, with Docker, is the README's [Quick start](../README.md#quick-start). In short:
+
+1. `python tools/setup.py --rom <your dump> --no-build` (generates `src/data`, `src/xlat`, `ct_assets.dat`; the ROM is yours, nothing is distributed).
+2. `sh tools/get_imgui.sh` (Dear ImGui 1.91.5 into `third_party/imgui`; without it the mods menu is compiled out).
+3. With devkitPro (`DEVKITPRO` set; packages libnx, switch-sdl2, switch-mesa, switch-cmake; the `devkitpro/devkita64` Docker image has them all):
    `cmake -S switch -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake && cmake --build build-switch -j`
    -> `build-switch/ct_field.nro`.
 
 ## Install
 
-Put these in `sdmc:/switch/ct/` on the SD card:
+Put these in a folder of the SD card, e.g. `sdmc:/switch/ChronoTrigger-NX/` (the program works in the folder it is started from):
 
 | file | from |
 |---|---|
 | `ct_field.nro` | the build |
 | `ct_assets.dat` | setup |
-| `Chrono_Trigger_USA_SNES.sfc` | your dump (battles and the sound driver read it) |
+| `Chrono_Trigger_USA_SNES.sfc` | setup (your dump, verified; battles and the sound driver read it) |
 
-`ct_sram.srm` (the battery save), `ct_settings.ini` and `ct_log.txt` (stdout/stderr) appear in the same folder.
+`ct_sram.srm` (the battery save), `ct_settings.ini`, `ct_log.txt` (stdout/stderr) and `ct_stats.txt` (the per-second performance line) appear in the same folder.
 Launch from the homebrew menu in **application mode** (hold R on a game) for the full memory and CPU budget.
 
 ## Controls
@@ -31,8 +34,9 @@ face button = B, right = A, left = Y, top = X; L/R, `-` = Select, `+` = Start; l
 
 ## Status
 
-Cross-builds and links. **Not yet run on hardware or an emulator**: performance (the vendored SNES core and the
-`src/xlat` stages run on the CPU) and the SDL_Renderer path on the console are unmeasured. The F1 overlay is the stub.
+Runs on hardware. On the base clocks at the 4x internal resolution it holds about 60 f/s in the title, the field, the overworld and
+battles (a soft 60: see the stats below for the frames that spike, mostly the sound driver's song and sample-set loads); the
+boosted profiles leave more headroom. The mods menu is described below.
 
 ## The CPU clock
 
@@ -50,10 +54,10 @@ rc=<last result>` (`bench` is a fixed loop: ~610 us boosted, ~1175 us at 1020 MH
 
 ## The mods menu (L3 + R3)
 
-The PC's F1 overlay (widescreen, internal resolution, frames between, sync mode, controls, ...) is built into the Switch build with
+The mods menu (widescreen, internal resolution, frames between, sync mode, controls, ...) is built into the Switch build with
 Dear ImGui 1.91.5. Press **L3 + R3** (both sticks) to open it, and again to close it; the left stick / d-pad moves, A selects, B backs out.
 The game is paused while it is open, and changes are saved to `ct_settings.ini` on close. Build note: `third_party/imgui` must exist
-(`tools/get_imgui.ps1`, or copy ImGui 1.91.5's core files and its `imgui_impl_sdl2` / `imgui_impl_sdlrenderer2` backends there);
+(`sh tools/get_imgui.sh`);
 the Switch target is SDL_Renderer only (`CT_NO_GL`).
 
 ## The render thread
