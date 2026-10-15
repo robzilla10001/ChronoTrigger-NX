@@ -11,6 +11,7 @@
 //   BG3H += $1BF1; BG3V += $1BF3; clear both.                 (camera follow, free-running 16-bit)
 // The NMI copies shadows $20-$2B to BG1/2/3 HOFS/VOFS (C2/01D8-0211). No edge clamps: the
 // overworld is a TORUS (camera == playerPos-(128,112), both mod map size).
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct CtWorldCam {
@@ -238,3 +239,4 @@ int CtWorldMusicObj(uint8_t* ram, int b);
 void CtWorldMoverFrame(CtWorldMover* m, const uint8_t* ram,
                        int heldUp, int heldDown, int heldLeft, int heldRight,
                        int* dxOut, int* dyOut);
+void CtWorldStateVars(void (*add)(const char* name, void* p, size_t n));   // the overworld's cross-frame variables, for the save-state framework

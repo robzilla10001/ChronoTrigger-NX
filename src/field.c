@@ -23,6 +23,7 @@
 #include "switch_platform.h"
 #include "hoststats.h"
 #include "hostpool.h"
+#include "savestate_engine.h"
 #include "SDL.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,7 +102,7 @@
 // run before the frame loop) stay as plain getenv calls. Behavior-identical.
 static struct {
   const char *fadeTrace, *owIdleShot, *owDbg, *worldDbg, *panShot, *bg3Dbg, *playerObj,
-      *saveStateAt, *saveState, *stateRound, *talkAt, *touchAt, *activate, *callFn, *testFollow, *tbText, *nameAs,
+      *saveStateAt, *saveState, *stateRound, *ssRound, *talkAt, *touchAt, *activate, *callFn, *testFollow, *tbText, *nameAs,
       *actDbg, *drawListDbg, *drawListOff, *tbAutoAdv, *run, *touchDbg, *ngSkip, *trigDbg, *changeLoc, *catTrace,
       *storyDbg, *storyObj, *dumpAll, *dumpMapAt, *noAnim, *camInfo, *posAll, *noNpc, *hideObj,
       *stenDbg, *pdbg, *drawDbg, *noSten, *stenDx, *stenDy, *stenViz, *noFg,
@@ -306,7 +307,7 @@ static void dbgInit(void) {
   // one paces on vsync by itself.)
   g_noPace = getenv("CT_NOPACE") != NULL;
   dbg.playerObj = getenv("CT_PLAYEROBJ"); dbg.saveStateAt = getenv("CT_SAVESTATE_AT");
-  dbg.stateRound = getenv("CT_STATEROUNDTRIP");
+  dbg.stateRound = getenv("CT_STATEROUNDTRIP"); dbg.ssRound = getenv("CT_SS_ROUNDTRIP");
   dbg.saveState = getenv("CT_SAVESTATE"); dbg.talkAt = getenv("CT_TALKAT");
   dbg.touchAt = getenv("CT_TOUCHAT"); dbg.activate = getenv("CT_ACTIVATE");
   dbg.callFn = getenv("CT_CALLFN");
@@ -4682,14 +4683,14 @@ static uint16_t fieldLockInputBits(int scripted, int dx, int dy, int a, int b, i
 // projections compared after the tick) -- not a pad-latch change.
 // The BATTLE counts its own frames against the cartridge's battle states label for label (the run-away counter
 // reads `$4218` a frame late, battle.c), so it keeps the auto-read register of the frame before: g_padAutoRead.
+static uint16_t g_padPrevPort = 0;   // fieldPadNmi: last frame's port word (the latch's edge detection) -- state of a saved game
 static uint16_t g_padAutoRead = 0;   // the battle's $4218 | $4219 << 8: the previous frame's controller
 static void fieldPadNmi(uint16_t serial) {
-  static uint16_t prevPort = 0;
   uint16_t port = 0;                               // snes_doAutoJoypad: bit N of the serial word -> bit 15-N
   for (int i = 0; i < 16; i++) if (serial & (1u << i)) port |= (uint16_t)(1u << (15 - i));
-  g_padAutoRead = prevPort;
+  g_padAutoRead = g_padPrevPort;
   CtJoypadPoll(CtWramSys(fieldWram()), port);
-  prevPort = port;
+  g_padPrevPort = port;
 }
 
 // ONE oracle frame per engine frame, the CT_PROJECT comparisons, and the per-projection verdict --
@@ -9476,6 +9477,292 @@ static int fieldStickChord(const SDL_Event* e) {
   int other = b == SDL_CONTROLLER_BUTTON_LEFTSTICK ? SDL_CONTROLLER_BUTTON_RIGHTSTICK : SDL_CONTROLLER_BUTTON_LEFTSTICK;
   return SDL_GameControllerGetButton(g_pad, (SDL_GameControllerButton)other) != 0;
 }
+// The save/load state menu on a controller: both triggers (ZL + ZR). The triggers are axes: true on the event that brings the second one past half
+// its travel while the first is already there, so one squeeze of the pair is one toggle (it must be released before it can toggle again).
+static int fieldTriggerChord(const SDL_Event* e) {
+  static int zl, zr, both;
+  if (e->type != SDL_CONTROLLERAXISMOTION) return 0;
+  if (e->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT) zl = e->caxis.value > 16384;
+  else if (e->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) zr = e->caxis.value > 16384;
+  else return 0;
+  int now = zl && zr, edge = now && !both;
+  both = now;
+  return edge;
+}
+// The text box's converted / name-resolved dialogue text: the box shows tbStr, which points into these (state, so file scope, not a block static).
+static char tbConvBuf[4096], tbNameBuf[4096];
+static Field* g_ssField;
+// STGE: a translated stage that is running (the motorcycle race, entry 3, the gate warp): the vendored machine it runs on, through snes_saveState. A load opens a stage of
+// the same entry first (as the loop does: the host's WRAM, the host's SPC) and loads the machine into it; a state with no stage closes the one that runs.
+static CtSsHost g_ssh;
+static CtXlatStage** g_ssSeqX; static CtXlatStage** g_ssGwX; static int* g_ssGwOp; static int* g_ssSeqOpenP;
+static int ssStageSave(void* c, CtSsBuf* o) {
+  (void)c; CtXlatStage* st = g_ssSeqX && *g_ssSeqX ? *g_ssSeqX : g_ssGwX && *g_ssGwX ? *g_ssGwX : NULL;
+  if (!st) { CtSsPutU8(o, 0); return 0; }
+  int gw = !(g_ssSeqX && *g_ssSeqX);
+  int id = gw ? (g_ssGwOp ? *g_ssGwOp : -1) : (g_ssField && g_ssField->vm ? CtSceneSequence(g_ssField->vm) : -1);
+  if (id < 0 || id > 255) return 1;
+  size_t n = CtXlatStageStateSize(st); uint8_t* t = (uint8_t*)malloc(n); if (!t) return 1;
+  if (!CtXlatStageStateSave(st, t)) { free(t); return 1; }
+  CtSsPutU8(o, gw ? 2 : 1); CtSsPutU8(o, (uint32_t)id); CtSsPutU32(o, (uint32_t)n); CtSsPut(o, t, n); free(t); return 0;
+}
+static int ssStageCheck(void* c, const uint8_t* d, size_t n, uint16_t v) { (void)c; (void)v; return n < 1 || (d[0] == 0 ? n != 1 : (d[0] > 2 || n < 6)); }
+static int ssStageLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; if (!g_ssSeqX || !g_ssGwX) return 0;
+  CtSsReader r = CtSsReaderOf(d, n); int kind = (int)CtSsGetU8(&r);
+  CtXlatStage** want = kind == 1 ? g_ssSeqX : kind == 2 ? g_ssGwX : NULL;
+  int id = 0; uint32_t sn = 0; const uint8_t* blob = NULL;
+  if (kind) { id = (int)CtSsGetU8(&r); sn = CtSsGetU32(&r); blob = CtSsGet(&r, sn); if (r.err) return 1; }
+  if (*g_ssSeqX && want != g_ssSeqX) { CtXlatStageClose(*g_ssSeqX); *g_ssSeqX = NULL; }                  // (a stage the state does not have)
+  if (*g_ssGwX && want != g_ssGwX) { CtXlatStageClose(*g_ssGwX); *g_ssGwX = NULL; }
+  if (!kind) return 0;
+  if (!*want) {                                                                                            // open the stage the state had, as the loop does
+    long xrl = 0; const uint8_t* xrb = CtBattleRom(&xrl); if (!xrb) return 1;
+    *want = CtXlatStageOpen(xrb, xrl, CtWramSys(fieldWram()), (uint8_t)id, g_ssh.audio ? CtAudioApu(g_ssh.audio) : NULL, 0);
+    if (!*want) return 1;
+    CtXlatStageSetRule(*want, getenv("CT_XLAT_NORULE") ? 0 : 1);
+  }
+  return !CtXlatStageStateLoad(*want, blob, sn);
+}
+// FCPT: which collision source the host reads tiles from (g_fc / g_fcWram: the field's planes, or the scene's WRAM page; both are pointers to things that stay put).
+static int ssFcptSave(void* c, CtSsBuf* o) {
+  (void)c; CtSsPutU8(o, g_fcWram ? 1 : 0); CtSsPutU8(o, g_fc == NULL ? 0 : (g_ssField && g_fc == &g_ssField->C) ? 1 : 2); return g_fc && (!g_ssField || g_fc != &g_ssField->C);   // (any other handle: refuse)
+}
+static int ssFcptCheck(void* c, const uint8_t* d, size_t n, uint16_t v) { (void)c; (void)v; return n != 2 || d[0] > 1 || d[1] > 1; }
+static int ssFcptLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; (void)n; g_fcWram = d[0] ? CtWramSys(fieldWram()) : NULL; g_fc = d[1] && g_ssField ? &g_ssField->C : NULL; return 0;
+}
+// BTLH: the battle module's host record (CtBattleHost, battle.h): ATB, the combatants, the action machine, the effect state. Its first four members are pointers
+// (the engine's image, the glb page, the callback and its context); the host sets those when a battle begins (fieldBattleConsumer) and a load sets them the same way.
+static CtBattleHost* g_ssBattle;
+static int ssBattleSave(void* c, CtSsBuf* o) {
+  (void)c; if (!g_ssBattle) return 0;
+  CtSsPutU32(o, (uint32_t)sizeof(CtBattleHost)); CtSsPutU8(o, g_ssBattle->mem ? 1 : 0);                   // (was a battle's record set up: its pointers are the host's, set again below)
+  CtSsPut(o, (const uint8_t*)g_ssBattle + 4 * sizeof(void*), sizeof(CtBattleHost) - 4 * sizeof(void*)); return 0;
+}
+static int ssBattleCheck(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; if (!n) return 0; CtSsReader r = CtSsReaderOf(d, n); return CtSsGetU32(&r) != (uint32_t)sizeof(CtBattleHost) || n != 5 + sizeof(CtBattleHost) - 4 * sizeof(void*);
+}
+static int ssBattleLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; if (!n || !g_ssBattle) return 0;
+  memcpy((uint8_t*)g_ssBattle + 4 * sizeof(void*), d + 5, sizeof(CtBattleHost) - 4 * sizeof(void*));
+  uint8_t* s7 = CtWramSys(fieldWram());                                                                      // (as a battle's begin sets them)
+  g_ssBattle->mem = d[4] ? s7 : NULL; g_ssBattle->glb = d[4] ? s7 + 0x10000 : NULL; g_ssBattle->frame = NULL; g_ssBattle->ctx = NULL;
+  return 0;
+}
+// SDAT: the scene's picture data as the running scene has changed it (tile animation chips, palette, scroll): scene.c CtFieldSceneState*.
+static int ssSdatSave(void* c, CtSsBuf* o) {
+  (void)c; Field* f = g_ssField; if (!f || !f->sd) return 0;
+  size_t n = CtFieldSceneStateSize(f->sd); uint8_t* t = (uint8_t*)malloc(n ? n : 1); if (!t) return 1;
+  int ok = n && CtFieldSceneStateSave(f->sd, t); if (ok) CtSsPut(o, t, n); free(t); return n && !ok;
+}
+static int ssSdatCheck(void* c, const uint8_t* d, size_t n, uint16_t v) { (void)c; (void)d; (void)v; return n == 0 ? 0 : n < 768 * 64; }
+static int ssSdatLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; Field* f = g_ssField; if (!n) return 0; if (!f || !f->sd) return 1;
+  return !CtFieldSceneStateLoad(f->sd, d, n);
+}
+// TBPT: the text box's string pointer, as WHICH buffer it points into (the buffers themselves are variables, saved with the rest).
+static const char** g_ssTbStr;
+static int ssTbptKind(const char* p) { return !p ? 0 : p == tbNameBuf ? 1 : p == tbConvBuf ? 2 : p == g_chestMsg ? 3 : 4; }
+static int ssTbptSave(void* c, CtSsBuf* o) { (void)c; int k = g_ssTbStr ? ssTbptKind(*g_ssTbStr) : 0; if (k == 4) return 1; CtSsPutU8(o, (uint32_t)k); return 0; }   // (4 = an unknown buffer: refuse rather than save a pointer)
+static int ssTbptCheck(void* c, const uint8_t* d, size_t n, uint16_t v) { (void)c; (void)v; return n != 1 || d[0] > 3; }
+static int ssTbptLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; (void)n; if (!g_ssTbStr) return 0;
+  *g_ssTbStr = d[0] == 1 ? tbNameBuf : d[0] == 2 ? tbConvBuf : d[0] == 3 ? g_chestMsg : NULL; return 0;
+}
+// TITL: the title / credits sequence machine (CtTitleIntro, title_intro.h): plain data but for the sound sink, which is the host's and stays as it is.
+static CtTitleIntro* g_ssTitle;
+static int ssTitleSave(void* c, CtSsBuf* o) {
+  (void)c; if (!g_ssTitle) return 0;
+  CtTitleIntro* t = (CtTitleIntro*)malloc(sizeof *t); if (!t) return 1;
+  memcpy(t, g_ssTitle, sizeof *t); memset(&t->snd, 0, sizeof t->snd);
+  CtSsPutU32(o, (uint32_t)sizeof *t); CtSsPut(o, t, sizeof *t); free(t); return 0;
+}
+static int ssTitleCheck(void* c, const uint8_t* d, size_t n, uint16_t v) { (void)c; (void)d; (void)v; return n != 0 && n != 4 + sizeof(CtTitleIntro); }
+static int ssTitleLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; if (!n || !g_ssTitle) return 0;
+  CtTitleSoundSink keep = g_ssTitle->snd; memcpy(g_ssTitle, d + 4, sizeof *g_ssTitle); g_ssTitle->snd = keep; return 0;
+}
+// What a queued save / load needs the host for, run at a frame boundary: the request, the message, the host re-syncing from the restored WRAM.
+// Called at the top of the loop and by the state menu (the game is paused between two frames there too).
+static CtSsHost g_ssh;
+static Field* g_ssField;
+static uint32_t g_ssAudioAtSave;                    // (the round trip) the sound processor's state hash at the save, to be compared right after the load
+// What a load needs the host for FIRST: to be in the scene the state was taken in. A field scene is loaded the way a door loads it (fieldFree + fieldLoad, no
+// fade); everything the door's tail would set is in the state that is restored on top. Set up by the loop each frame (the pointers are main()'s).
+static struct { CtAssets* assets; int* inWorld; int* scene; World* wd; int* haveWorld; } g_ssEnter;
+static int fieldSsEnter(void* ctx, int mode, int where) {
+  (void)ctx; Field* f = g_ssField;
+  if (!f || !g_ssEnter.assets) return 1;
+  if (mode == CT_SS_MODE_WORLD) {                                    // the overworld: `where` is the location word ($0100), 1F0 + the world
+    if (*g_ssEnter.inWorld && *g_ssEnter.haveWorld) return 0;        // (the world we are in: its era is part of the state restored next)
+    fprintf(stderr, "[savestate] entering the overworld (location %03X) for the state being loaded\n", where);
+    fieldFree(f);
+    *g_ssEnter.haveWorld = worldInit(g_ssEnter.assets, g_ssEnter.wd, where - 0x1F0);
+    if (!*g_ssEnter.haveWorld) return 1;
+    *g_ssEnter.inWorld = 1; g_ssh.vm = NULL;
+    return 0;
+  }
+  if (mode != CT_SS_MODE_FIELD && mode != CT_SS_MODE_MENU && mode != CT_SS_MODE_BATTLE) return 1;
+  // The scene we are in is kept: it carries host-side setup a fresh load does not rebuild (what a door's load tail and a seeded start leave), and what a state
+  // changes in it (the tile chips, the palette, the scroll: SDAT; the maps and the collision: re-derived from the WRAM) is restored on top. Only another
+  // location is loaded.
+  if (!*g_ssEnter.inWorld && f->vm && *g_ssEnter.scene == where) return 0;
+  fprintf(stderr, "[savestate] entering location %d (from %s%d) for the state being loaded\n", where, *g_ssEnter.inWorld ? "the overworld, " : "", *g_ssEnter.scene);
+  fieldFree(f);
+  if (!fieldLoad(g_ssEnter.assets, f, where, NULL)) return 1;
+  *g_ssEnter.scene = where; *g_ssEnter.inWorld = 0; g_ssh.vm = f->vm;                                   // (the providers after this one meet the new scene's VM)
+  return 0;
+}
+// WRLD: the overworld's own state, `wd` (World): its camera, mover, the picture's latches, the pose bookkeeping. Pointers (into the host's image and the loaded
+// assets) are not state: worldInit has made them for the world the LOCN part brought us to, and they stay as they are. Only meaningful while on the overworld.
+typedef struct { World* wd; int* inWorld; } SsWorldCtx;
+static void ssWorldPtrs(World* w, const uint8_t** keep, int save) {                                  // the pointer fields, in a fixed order
+  int k = 0;
+  if (save) { keep[k++] = w->wram; keep[k++] = w->vram; } else { w->wram = (uint8_t*)keep[k++]; w->vram = (uint8_t*)keep[k++]; }
+  for (int i = 0; i < 16; i++) { if (save) keep[k++] = w->spr[i].px; else w->spr[i].px = keep[k++]; }
+  for (int i = 0; i < 4; i++) { if (save) keep[k++] = w->bird[i].px; else w->bird[i].px = keep[k++]; }
+  for (int i = 0; i < 4; i++) { if (save) keep[k++] = w->boat[i].px; else w->boat[i].px = keep[k++]; }
+  for (int i = 0; i < 16; i++) { if (save) keep[k++] = w->balloon[i].px; else w->balloon[i].px = keep[k++]; }
+}
+static int ssWorldSave(void* c, CtSsBuf* o) {
+  SsWorldCtx* x = (SsWorldCtx*)c;
+  CtSsPutU8(o, *x->inWorld && x->wd->vram ? 1 : 0);
+  if (!(*x->inWorld && x->wd->vram)) return 0;
+  World* t = (World*)malloc(sizeof(World)); if (!t) return 1;
+  memcpy(t, x->wd, sizeof(World));
+  t->wram = NULL; t->vram = NULL; for (int i = 0; i < 16; i++) t->spr[i].px = NULL; for (int i = 0; i < 4; i++) { t->bird[i].px = NULL; t->boat[i].px = NULL; } for (int i = 0; i < 16; i++) t->balloon[i].px = NULL;
+  CtSsPutU32(o, (uint32_t)sizeof(World)); CtSsPut(o, t, sizeof(World)); CtSsPut(o, x->wd->vram, 0x10000);
+  free(t); return 0;
+}
+static int ssWorldCheck(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)c; (void)v; if (n < 1) return 1; if (!d[0]) return n != 1;
+  return n != 1 + 4 + sizeof(World) + 0x10000;
+}
+static int ssWorldLoad(void* c, const uint8_t* d, size_t n, uint16_t v) {
+  (void)v; SsWorldCtx* x = (SsWorldCtx*)c; if (n < 1 || !d[0]) return 0;                              // (a field state: nothing of the world to restore)
+  if (!*x->inWorld || !x->wd->vram) return 1;                                                         // (LOCN must have brought us to the overworld)
+  const uint8_t* keep[48]; ssWorldPtrs(x->wd, keep, 1);
+  memcpy(x->wd, d + 5, sizeof(World)); ssWorldPtrs(x->wd, keep, 0);
+  memcpy(x->wd->vram, d + 5 + sizeof(World), 0x10000);
+  return 0;
+}
+// What a queued save / load needs the host for, run at a frame boundary: the request, the message, the host re-syncing from the restored WRAM.
+// Called at the top of the loop and by the state menu (the game is paused between two frames there too).
+// After a state is loaded the game has changed under the host's picture: derive the map and the collision again from the restored WRAM, bake the scene's picture
+// from the restored chips and palette, and drop the motion history (the picture before it is not the one that comes next).
+static const int* g_ssBattlePhase;                      // main()'s battlePhase (as restored by the state being loaded)
+static int g_ssForceBake;                              // set by a load: the loop's own bake (bgDirty) runs on the next frame
+static void fieldSsResync(Field* f) {
+  if (!f->vm) return;
+  // (in a battle the WRAM's map pages are the battle's, not the location's, and the scene data carries what the battle did to the arena: the SDAT part restored it)
+  if (!g_ssBattlePhase || !*g_ssBattlePhase) fieldMapFromWram(f, CtSceneMem7E(f->vm), "state");
+  g_ssForceBake = 1;
+  g_motBuf[g_motIdx].valid = 0;
+}
+static void fieldSaveStateRun(void) {
+  if (!CtSsPending(CtSsDefault())) return;
+  int ran = CtSsService(CtSsDefault());
+  int ok; unsigned ser; const char* msg = CtSsMessage(CtSsDefault(), &ok, &ser);
+  fprintf(stderr, "[savestate] %s\n", msg);
+  if (ran == CT_SS_LOAD && g_ssField && g_ssField->vm) fieldSsResync(g_ssField);
+}
+// CT_SS_DIFF=1 (a PC diagnostic, Linux, built with -O0 -g; tools like tools/ss_diff.py map its output to variable names): what a state does NOT restore. At the
+// round trip's save the whole of the program's global data and main()'s stack frame are copied; right after the load they are compared to the copy. Every byte
+// that differs is a variable the state left alone (or one the load itself changed: the host's clocks and caches show up as noise; the rest is the list of
+// what a provider still has to carry). Output: `ssdiff: data+<offset> <len>` / `ssdiff: frame-<offset> <len>` ranges.
+#if defined(__linux__) && !defined(__SWITCH__)
+extern char __data_start[], _end[];
+static uint8_t* g_ssdG; static size_t g_ssdGN; static uint8_t* g_ssdS; static size_t g_ssdSN; static char* g_ssdFrame;
+static void ssDiffCapture(char* frame, char* low) {
+  g_ssdGN = (size_t)(_end - __data_start); g_ssdG = (uint8_t*)realloc(g_ssdG, g_ssdGN); memcpy(g_ssdG, __data_start, g_ssdGN);
+  g_ssdFrame = frame; g_ssdSN = (size_t)(frame - low); g_ssdS = (uint8_t*)realloc(g_ssdS, g_ssdSN); memcpy(g_ssdS, low, g_ssdSN);
+  g_ssdFrame = frame; g_ssdSN = (size_t)(frame - low);
+}
+// CT_SS_FULLRESTORE=<dataLo>:<dataHi>:<stack 0/1> (diagnostic): after the state's load, put back the program's global data in [dataLo, dataHi) (offsets from
+// __data_start; 0:-1 = all) and, with stack=1, main()'s frame, from the copy taken at the save -- the harness's own variables kept as they are. If the round
+// trip then matches, what the state misses is plain variables in that range: bisect the range to find them.
+static void ssFullRestore(const char* spec) {
+  if (!g_ssdG) return;
+  long lo = 0, hi = -1; int stack = 0; sscanf(spec, "%ld:%ld:%d", &lo, &hi, &stack);
+  if (hi < 0 || (size_t)hi > g_ssdGN) hi = (long)g_ssdGN;
+  uint8_t* d = (uint8_t*)__data_start;
+  uint8_t* own[3] = { (uint8_t*)&g_ssdG, (uint8_t*)&g_ssdS, (uint8_t*)&g_ssdFrame }; uint8_t savedOwn[3][8]; size_t sn = g_ssdSN, gn = g_ssdGN;
+  for (int i = 0; i < 3; i++) memcpy(savedOwn[i], own[i], 8);
+  for (long i = lo; i < hi; i++) d[i] = g_ssdG[i];
+  for (int i = 0; i < 3; i++) memcpy(own[i], savedOwn[i], 8);
+  g_ssdSN = sn; g_ssdGN = gn;
+  if (stack) { uint8_t* cur = (uint8_t*)(g_ssdFrame - g_ssdSN); for (size_t i = 0; i < g_ssdSN; i++) cur[i] = g_ssdS[i]; }
+}
+static void ssDiffReport(void) {
+  if (!g_ssdG) return;
+  int shown = 0;
+  for (size_t i = 0; i < g_ssdGN && shown < 6000;) {
+    if (((uint8_t*)__data_start)[i] == g_ssdG[i]) { i++; continue; }
+    size_t j = i; while (j < g_ssdGN && ((uint8_t*)__data_start)[j] != g_ssdG[j]) j++;
+    printf("ssdiff: data+%zu %zu\n", i, j - i); shown++; i = j;
+  }
+  const uint8_t* cur = (const uint8_t*)(g_ssdFrame - g_ssdSN);
+  for (size_t i = 0; i < g_ssdSN && shown < 12000;) {
+    if (cur[i] == g_ssdS[i]) { i++; continue; }
+    size_t j = i; while (j < g_ssdSN && cur[j] != g_ssdS[j]) j++;
+    printf("ssdiff: frame-%zu %zu\n", g_ssdSN - i, j - i); shown++; i = j;
+  }
+  fflush(stdout);
+}
+#else
+static void ssDiffCapture(char* frame, char* low) { (void)frame; (void)low; }
+static void ssDiffReport(void) {}
+static void ssFullRestore(const char* spec) { (void)spec; }
+#endif
+// The save/load state menu (ZL + ZR), modal like the options: the game stands still while it is open. B, ZL+ZR again or "Return to game" close it.
+static int fieldStateModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
+  CtPresentSetAsync(pr, 0);
+  if (dev) SDL_PauseAudioDevice(dev, 1);
+  CtStateMenuOpen();
+  int open = 1, quit = 0;
+  while (open) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+      if (e.type == SDL_QUIT) { quit = 1; open = 0; }
+      else if (e.type == SDL_CONTROLLERDEVICEADDED) fieldPadOpen();
+      if (fieldTriggerChord(&e)) { open = 0; continue; }                 // ZL + ZR again closes it
+      if (CtOverlayProcessEvent(&e)) continue;
+      if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_ESCAPE && !CtStateMenuPopupOpen()) open = 0;
+      if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_B && !CtStateMenuPopupOpen()) open = 0;   // B backs out of a popup first
+    }
+    // CT_STATEMENU_TEST=1 (probe, with CT_SETTINGS holding `[states] confirm=0`): the host squeezes ZL+ZR at frame 40 (below), and in here a finger
+    // presses SAVE, LOAD, BACKUP ALL and RESTORE ALL on the window's own pixels (1024x896, the layout the screenshots show); ZL+ZR again closes it.
+    { static int tk = -1; if (tk < 0 && getenv("CT_STATEMENU_TEST")) tk = 0;
+      if (tk >= 0) {
+        static const struct { int at, x, y; } clicks[] = { { 8, 310, 412 }, { 18, 712, 412 }, { 28, 310, 594 }, { 38, 712, 594 } };
+        for (unsigned i = 0; i < sizeof clicks / sizeof clicks[0]; i++) if (tk == clicks[i].at) {
+          SDL_Event m; memset(&m, 0, sizeof m);                                  // a finger, as the console's SDL reports a touch (normalised position)
+          m.type = SDL_FINGERDOWN; m.tfinger.fingerId = 1; m.tfinger.x = clicks[i].x / 1024.f; m.tfinger.y = clicks[i].y / 896.f; SDL_PushEvent(&m);
+          m.type = SDL_FINGERUP; SDL_PushEvent(&m);
+        }
+        if (tk == 24 || tk == 34 || tk == 44) { int ok; unsigned ser; const char* mm = CtSsMessage(CtSsDefault(), &ok, &ser); printf("statemenu-test: after click %d: %s (%s)\n", tk == 24 ? 2 : tk == 34 ? 3 : 4, mm, ok ? "ok" : "refused"); }
+        if (tk == 14) { int ok; unsigned ser; const char* mm = CtSsMessage(CtSsDefault(), &ok, &ser); printf("statemenu-test: after click 1: %s (%s)\n", mm, ok ? "ok" : "refused"); }
+        if (tk == 46 || tk == 48) { SDL_Event t; memset(&t, 0, sizeof t); t.type = SDL_CONTROLLERAXISMOTION; t.caxis.axis = SDL_CONTROLLER_AXIS_TRIGGERLEFT; t.caxis.value = tk == 46 ? 0 : 32000; SDL_PushEvent(&t);
+                                    t.caxis.axis = SDL_CONTROLLER_AXIS_TRIGGERRIGHT; t.caxis.value = tk == 46 ? 0 : 32000; SDL_PushEvent(&t); }   // let go, then squeeze again: it closes
+        tk++;
+      } }
+    int r = CtStateMenuFrame();
+    if (r & CT_SMENU_SERVICE) fieldSaveStateRun();                       // the answer is on the menu from the next frame
+    if (r & CT_SMENU_CLOSE) open = 0;
+    hostDrawPicture(pr);
+    CtOverlayRender();
+    CtPresentSwap(pr);
+    if (!CtSettingsGet()->vsync) SDL_Delay(16);
+  }
+  CtSettingsSave();                                                      // (the two toggles)
+  g_hostT0 = -1.0; g_hostFrames = 0;
+  g_paceLastExit = -1.0;
+  CtStatsClockReset();
+  CtPresentSetAsync(pr, 1);
+  if (dev) { SDL_ClearQueuedAudio(dev); SDL_PauseAudioDevice(dev, 0); }
+  return quit;
+}
 // The F1 overlay, modal: draws the paused picture and the options until the player closes them; 1 = leave the game.
 static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
   CtPresentSetAsync(pr, 0);                          // the overlay draws on this thread: wait for the render thread, take the renderer back
@@ -9509,7 +9796,16 @@ static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
   return quit;
 }
 
+// field.c's own file-scope state, registered with the save-state framework (once, at startup).
+static void fieldSsRegisterStatics(void) {
+#include "ss_field_vars.inc"
+  CtBattleStateVars(CtSsVarAdd);                      // the battle module's own, by name
+  CtWorldStateVars(CtSsVarAdd);                       // the overworld's own
+  snes_stateVars(CtSsVarAdd);                         // the logical-frame machinery's (a translated stage runs under it)
+}
+
 int main(int argc, char** argv) {
+  fieldSsRegisterStatics();
   CtAudioClockHook = CtStatsNow;                  // (hoststats: the handshakes are timed)
   CtSwitchInit(&argc, &argv);                    // (the Switch host only: the folder, the log, the default arguments)
   CtSceneSetParallel(CtParallelFor);             // (the host pool: serial unless CT_THREADS / the Switch says otherwise)
@@ -9646,6 +9942,7 @@ int main(int argc, char** argv) {
       menuTest = 1;                                            // fade -> save -> menu screen fnv32 + panel data ->
       if (i + 1 < argc && argv[i + 1][0] != '-') btWramPath = argv[++i];   // B -> restore, resume byte-identical)
     }
+    else if (!strcmp(argv[i], "--savestate-selftest")) { return CtSsSelfTest(); }   // the save-state container's own checks (savestate.c)
     else if (!strcmp(argv[i], "--selftest")) { selftest = 1; if (i + 1 < argc && argv[i + 1][0] != '-') shot = argv[++i]; }
     else if (!strcmp(argv[i], "--seqstage")) {
       // --seqstage <entry> <frames> [page] : run ONE entry of the $C3 SEQUENCE TABLE standalone --
@@ -10936,7 +11233,7 @@ int main(int argc, char** argv) {
   // dummy video driver) keeps the defaults, so nothing a player saved can move a regression check.
   { const char* vd = SDL_GetCurrentVideoDriver();
     g_hostInteractive = !selftest && !g_noPace && !(vd && !strcmp(vd, "dummy"));
-    if (getenv("CT_OVERLAY_SHOT")) g_hostInteractive = 1; }   // (the probe below: the overlay without a visible window)
+    if (getenv("CT_OVERLAY_SHOT") || getenv("CT_STATEMENU_TEST") || getenv("CT_HIDDEN_WINDOW")) g_hostInteractive = 1; }   // (the probe below: the overlay without a visible window)
   CtSettingsLoad(g_hostInteractive);
   if (g_hostInteractive && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) fieldPadOpen();
   int audioOn = (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0);
@@ -11037,7 +11334,7 @@ int main(int argc, char** argv) {
     const CtSettings* st = CtSettingsGet();
     hostWindowSize(&pc.w, &pc.h);
     pc.fullscreen = st->fullscreen; pc.backend = st->backend; pc.sdlDriver = st->renderDriver; pc.vsync = st->vsync;
-    pc.hidden = getenv("CT_OVERLAY_SHOT") != NULL;     // (the probe: no window on the player's screen)
+    pc.hidden = getenv("CT_OVERLAY_SHOT") != NULL || getenv("CT_STATEMENU_TEST") != NULL || getenv("CT_HIDDEN_WINDOW") != NULL;     // (the probe: no window on the player's screen)
   }
   CtSwitchTrace("creating the window");
   CtPresenter* pr = CtPresentCreate(&pc);
@@ -11406,6 +11703,7 @@ int main(int argc, char** argv) {
   int atbSelRow = 0;
   int atbTypeStep = 1 << 20;
 
+#include "ss_main_vars.inc"                       /* the host loop's variables that are a game's state (savestate_engine.h SSV) */
   while (running && !g_shotsExit) {
     fieldIrqPreFlip = 0;                             // set by this frame's return-chain wait, if any (the battle's ack)
     // C0/000E, THE COLD INIT, reached from a running game this frame (the demo battle's CF/E702, the defeat's C0/02CA):
@@ -11418,9 +11716,14 @@ int main(int argc, char** argv) {
                                                      // pipeline frame with no C0/00BF in it -> no VM tick)
     SDL_Event e;
     int optionsReq = 0;                              // F1 (or the controller's Guide): the options overlay, this pass
+    if (getenv("CT_STATEMENU_TEST") && frameNo == 40) {   // (probe) ZL + ZR, as the console's triggers would report them
+      SDL_Event t; memset(&t, 0, sizeof t); t.type = SDL_CONTROLLERAXISMOTION; t.caxis.axis = SDL_CONTROLLER_AXIS_TRIGGERLEFT; t.caxis.value = 32000; SDL_PushEvent(&t);
+      t.caxis.axis = SDL_CONTROLLER_AXIS_TRIGGERRIGHT; SDL_PushEvent(&t); }
+    int stateReq = 0;                                // ZL + ZR: the save/load state menu, this pass
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) running = 0;           // window X: quit ONLY (never resolves a battle -- see battlePhase)
       else if (e.type == SDL_CONTROLLERDEVICEADDED) fieldPadOpen();
+      else if (fieldTriggerChord(&e)) { if (CtOverlayAvailable()) stateReq = 1; }
       else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
         if (g_pad && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pad)) == e.cdevice.which) {
           SDL_GameControllerClose(g_pad); g_pad = NULL; fieldPadOpen(); } }
@@ -11462,6 +11765,176 @@ int main(int argc, char** argv) {
     // THE OPTIONS OVERLAY (F1): the game stands still -- no tick, no sound -- while the player edits settings.h's options
     // over the last picture; they are saved on close, and the host clock re-anchors so the pause costs no catch-up.
     if (optionsReq && fieldOptionsModal(pr, audioDev)) running = 0;
+    else if (stateReq) {
+      if (fieldStateModal(pr, audioDev)) running = 0;
+      if (getenv("CT_STATEMENU_TEST")) { printf("statemenu-test: the menu closed on ZL+ZR; frame %d, the game resumes\n", frameNo); fflush(stdout); running = 0; }
+    }
+    // ---- SAVE STATES (savestate.h): a request from the mods menu (or a test) runs HERE, between two whole frames: HERE, where the state menu also runs, at the start of the frame ----
+    // What a state is made of is savestate_engine.c's; where one can be taken is this block's call, and it is conservative: a location in free
+    // play only. The battle, the menus, the overworld, the title's machines, a fade, a door being taken are refused with a reason until their
+    // own parts of the machine are providers (docs/SAVESTATES.md).
+    if (!selftest || dbg.ssRound) {
+      static int ssBound;
+      g_ssField = &f;
+      if (!ssBound) {
+        g_ssh.sram = fieldSram(); g_ssh.sramLen = CT_SRAM_BYTES; g_ssh.px = &px; g_ssh.py = &py; g_ssh.pz = &pz; g_ssh.pfac = &pfac; g_ssh.frame = &frameNo; g_ssh.padPrev = &g_padPrevPort; g_ssh.padAuto = &g_padAutoRead;
+        CtSsEngineBind(CtSsDefault(), &g_ssh); ssBound = 1;
+        { static CtSsProvider stge = { "STGE", 1, 1, 0, NULL, ssStageSave, ssStageCheck, ssStageLoad }; g_ssSeqX = &seqX; g_ssGwX = &gwX; g_ssGwOp = &gwOp; CtSsRegister(CtSsDefault(), &stge, NULL); }
+        { static CtSsProvider fcpt = { "FCPT", 1, 1, 0, NULL, ssFcptSave, ssFcptCheck, ssFcptLoad }; CtSsRegister(CtSsDefault(), &fcpt, NULL); }
+        { static CtSsProvider btlh = { "BTLH", 1, 1, 0, NULL, ssBattleSave, ssBattleCheck, ssBattleLoad }; g_ssBattle = &liveHost; CtSsRegister(CtSsDefault(), &btlh, NULL); }
+        { static CtSsProvider sdat = { "SDAT", 1, 1, 0, NULL, ssSdatSave, ssSdatCheck, ssSdatLoad }; CtSsRegister(CtSsDefault(), &sdat, NULL); }
+        { static CtSsProvider tbpt = { "TBPT", 1, 1, 0, NULL, ssTbptSave, ssTbptCheck, ssTbptLoad }; g_ssTbStr = &tbStr; CtSsRegister(CtSsDefault(), &tbpt, NULL); }
+        { static CtSsProvider titl = { "TITL", 1, 1, 0, NULL, ssTitleSave, ssTitleCheck, ssTitleLoad }; g_ssTitle = &titleIntro; CtSsRegister(CtSsDefault(), &titl, NULL); }
+        { static SsWorldCtx wctx; wctx.wd = &wd; wctx.inWorld = &inWorld; static CtSsProvider wrld = { "WRLD", 1, 1, 0, NULL, ssWorldSave, ssWorldCheck, ssWorldLoad }; CtSsRegister(CtSsDefault(), &wrld, &wctx); }
+      }
+      g_ssBattlePhase = &battlePhase; g_ssEnter.assets = &assets; g_ssEnter.inWorld = &inWorld; g_ssEnter.scene = &scene; g_ssEnter.wd = &wd; g_ssEnter.haveWorld = &haveWorld; g_ssh.enter = fieldSsEnter;
+      g_ssh.wram = CtWramSys(fieldWram()); g_ssh.vm = f.vm;
+      g_ssh.audio = audio;
+      g_ssh.scene = inWorld ? (g_ssh.wram[0x0100] | (g_ssh.wram[0x0101] << 8)) : scene;      // (the overworld: its location word, 1F0 + the world)
+      g_ssh.fb = fb; g_ssh.fbW = CAMW; g_ssh.fbH = CAMH;
+      g_ssh.loc = g_ssh.wram[0x0100] | (g_ssh.wram[0x0101] << 8);
+      g_ssh.mode = battlePhase ? CT_SS_MODE_BATTLE : inWorld ? CT_SS_MODE_WORLD : menuPhase ? CT_SS_MODE_MENU : CT_SS_MODE_FIELD;
+      g_ssh.unavailable = NULL;      // every mode saves: the field, the menu, the overworld, a battle, a fade, a translated stage, the title and the load screen (docs/SAVESTATES.md)
+      if ((dbg.ssRound || getenv("CT_SS_XSAVE") || getenv("CT_SS_XLOAD")) && getenv("CT_SS_FORCE")) g_ssh.unavailable = NULL;      // (the round trip probing a mode the game still refuses to save in)
+      // CT_SS_ROUNDTRIP=<A>:<B>: the framework's own proof, in one process. At frame A save a state (in memory); run B frames, hashing the WRAM and
+      // the picture after each; at frame A+B load the state back and run the same B frames again; the two runs must be identical. The first
+      // frame that differs, and the first WRAM byte, name what the state is missing. (Needs a free-play location: --scene N --frames <A+B+2>.)
+      // CT_SS_XSAVE=<frame>:<n>:<path> / CT_SS_XLOAD=<path> (the cross-process proof): one process saves a state at <frame> to <path>.ctstate and records the hashes of the
+      // <n> frames after it (<path>.hashes); ANOTHER, started from anywhere (the title, another scene), loads that file at its frame 3 and must reproduce them. What
+      // an in-process round trip can hide -- a state that leans on what this process did before -- cannot hide here.
+      { static int xs = -2, xN = 0, xFrame = 0, xRec = 0, xDone = 0; static char xPath[400]; static uint32_t xh[3][2000]; static const char* xl;
+        if (xs == -2) { xs = 0; const char* e = getenv("CT_SS_XSAVE"); xl = getenv("CT_SS_XLOAD");
+                        if (e && sscanf(e, "%d:%d:%399s", &xFrame, &xN, xPath) == 3) { xs = 1; if (xN > 2000) xN = 2000; } else if (xl) { snprintf(xPath, sizeof xPath, "%s", xl); xs = 2; } }
+        if (xs && !xDone) {
+          if (xRec > 0 && xRec <= xN + 1) {                         // the frame the previous iteration left, hashed
+            int k = xRec - 1;
+#if defined(__linux__) && !defined(__SWITCH__)
+            if (k == 0 && getenv("CT_SS_DIFF") && atoi(getenv("CT_SS_DIFF")) == 3) {     // CT_SS_DIFF=3: the program's global data, the saver's and the loader's, one frame after the load
+              char dp[420]; snprintf(dp, sizeof dp, "%s.data", xPath); size_t gn = (size_t)(_end - __data_start);
+              if (xs == 1) { FILE* df = fopen(dp, "wb"); if (df) { fwrite(__data_start, 1, gn, df); fclose(df); } }
+              else { FILE* df = fopen(dp, "rb"); uint8_t* o = df ? (uint8_t*)malloc(gn) : NULL;
+                if (o && fread(o, 1, gn, df) == gn) { int shown = 0; for (size_t i = 0; i < gn && shown < 6000;) { if ((uint8_t)__data_start[i] == o[i]) { i++; continue; }
+                    size_t j = i; while (j < gn && (uint8_t)__data_start[j] != o[j]) j++; printf("ssdiff: data+%zu %zu\n", i, j - i); shown++; i = j; } }
+                free(o); if (df) fclose(df); fflush(stdout); }
+              { char* sp = NULL;                                                    // and main()'s frame, the same way (frame-<offset from its top> <len>)
+#if defined(__x86_64__)
+                __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+#endif
+                char* fr = (char*)__builtin_frame_address(0);
+                if (sp) { size_t fn = (size_t)(fr - sp); snprintf(dp, sizeof dp, "%s.frame", xPath);
+                  if (xs == 1) { FILE* df = fopen(dp, "wb"); if (df) { fwrite(&fn, 8, 1, df); fwrite(sp, 1, fn, df); fclose(df); } }
+                  else { FILE* df = fopen(dp, "rb"); size_t on = 0; uint8_t* o = NULL; if (df && fread(&on, 8, 1, df) == 1 && on == fn && (o = (uint8_t*)malloc(fn)) && fread(o, 1, fn, df) == fn) {
+                      for (size_t i = 0; i < fn;) { if ((uint8_t)sp[i] == o[i]) { i++; continue; } size_t j = i; while (j < fn && (uint8_t)sp[j] != o[j]) j++; printf("ssdiff: frame-%zu %zu\n", fn - i, j - i); i = j; } }
+                    else printf("xload: frame sizes differ (%zu vs %zu)\n", fn, on);
+                    free(o); if (df) fclose(df); fflush(stdout); } } } }
+#endif
+            uint8_t* ab; int an; uint32_t ah = 0; if (audio && CtAudioStateSave(audio, &ab, &an)) { ah = ctFnv32(ab, (size_t)an); free(ab); }
+            xh[0][k] = ctFnv32(g_ssh.wram, 0x20000);
+            if (getenv("CT_SS_VERBOSE") && xN <= 400) { static uint8_t* xw; if (!xw) xw = (uint8_t*)malloc((size_t)xN * 0x20000); if (xw) memcpy(xw + (size_t)k * 0x20000, g_ssh.wram, 0x20000);
+              if (xRec == xN) { char wp[420]; snprintf(wp, sizeof wp, "%s.wram", xPath);
+                if (xs == 1) { FILE* wf = fopen(wp, "wb"); if (wf && xw) { fwrite(xw, 0x20000, (size_t)xN, wf); } if (wf) fclose(wf); }
+                else { FILE* wf = fopen(wp, "rb"); if (wf && xw) { static uint8_t rb[0x20000]; for (int q = 0; q < xN && fread(rb, 1, 0x20000, wf) == 0x20000; q++) { int nd = 0;
+                         for (int i = 0; i < 0x20000; i++) if (rb[i] != xw[(size_t)q * 0x20000 + i]) { if (nd < 24) printf("xload: frame %d WRAM $%05X: saved %02X, loaded %02X\n", q + 1, i, rb[i], xw[(size_t)q * 0x20000 + i]); nd++; }
+                         if (nd) { printf("xload: frame %d: %d WRAM bytes differ\n", q + 1, nd); break; } } } if (wf) fclose(wf); } } } xh[1][k] = ctFnv32(fb, (size_t)CAMW * CAMH * 3); xh[2][k] = ah; xRec++;
+            if (xRec > xN) {
+              char hp[420]; snprintf(hp, sizeof hp, "%s.hashes", xPath);
+              if (xs == 1) { FILE* hf2 = fopen(hp, "wb"); if (hf2) { fwrite(&xN, 4, 1, hf2); fwrite(xh, sizeof xh[0], 3, hf2); fclose(hf2); } printf("xsave: saved a state at frame %d and %d frames of hashes -> %s\n", xFrame, xN, xPath); }
+              else { static uint32_t ref[3][2000]; int n0 = 0; FILE* hf2 = fopen(hp, "rb"); int ok = hf2 && fread(&n0, 4, 1, hf2) == 1 && fread(ref, sizeof ref[0], 3, hf2) == 3; if (hf2) fclose(hf2);
+                if (!ok) printf("xload: no hashes at %s\n", hp);
+                else { int bad = -1, what = 0; for (int q = 0; q < xN && q < n0 && bad < 0; q++) for (int w = 0; w < 3; w++) if (xh[w][q] != ref[w][q]) { bad = q; what = w; break; }
+                       if (bad < 0) printf("xload: the %d frames after the load in a FRESH process are identical to the saving process's (sound + WRAM + picture): MATCH\n", xN);
+                       else printf("xload: DIVERGES %d frame(s) after the load: %s differs\n", bad + 1, what == 0 ? "WRAM" : what == 1 ? "the picture" : "the sound"); } }
+              fflush(stdout); xDone = 1; running = 0; } }
+          if (!xDone && xs == 1 && frameNo == xFrame && !xRec) {
+            uint8_t* im; size_t il; const char* why = NULL;
+            if (CtSsSaveImage(CtSsDefault(), &im, &il, &why)) { printf("xsave: not saved at frame %d: %s\n", xFrame, why); xDone = 1; running = 0; }
+            else { char sp[420]; snprintf(sp, sizeof sp, "%s.ctstate", xPath); FILE* sf = fopen(sp, "wb"); if (sf) { fwrite(im, 1, il, sf); fclose(sf); } CtSsFreeImage(im); xRec = 1;
+                   printf("xsave: state at frame %d (menuPhase %d, battle %d, world %d, fade %d, seq %d) -> %s\n", frameNo, menuPhase, battlePhase, inWorld, fade, seqOpen, sp); } }
+          if (!xDone && xs == 2 && frameNo == 3 && !xRec) {
+            char sp[420]; snprintf(sp, sizeof sp, "%s.ctstate", xPath); FILE* sf = fopen(sp, "rb"); uint8_t* im = NULL; size_t il = 0;
+            if (sf) { fseek(sf, 0, SEEK_END); il = (size_t)ftell(sf); fseek(sf, 0, SEEK_SET); im = (uint8_t*)malloc(il); if (fread(im, 1, il, sf) != il) { free(im); im = NULL; } fclose(sf); }
+            const char* why = NULL; int part = 0;
+            if (!im || CtSsLoadImage(CtSsDefault(), im, il, &why, &part)) { printf("xload: load failed: %s\n", im ? why : "no state file"); xDone = 1; running = 0; }
+            else { fieldSsResync(&f); xRec = 1; printf("xload: loaded %s at frame 3; now at frame %d\n", sp, frameNo);
+                   char hp2[420]; snprintf(hp2, sizeof hp2, "%s.hashes", xPath); FILE* h2 = fopen(hp2, "rb"); if (h2) { if (fread(&xN, 4, 1, h2) != 1) xN = 0; fclose(h2); } if (xN > 2000) xN = 2000; }
+            free(im); }
+        } }
+      if (dbg.ssRound) {
+        static int A = -1, B = 0, pass = 0, done = 0; static uint8_t* img; static size_t imgLen; static uint32_t hw[2][600], hf[2][600], ha[2][600]; static uint8_t* w1; static uint8_t* f1;
+        if (A < 0) { A = 0; sscanf(dbg.ssRound, "%d:%d", &A, &B); if (B > 600) B = 600; if (B < 1) B = 1; w1 = (uint8_t*)malloc((size_t)B * 0x20000); f1 = (uint8_t*)malloc((size_t)(B < 120 ? B : 120) * CAMW * CAMH * 3); }
+        if (!done && A > 0) {
+          if (frameNo > A && frameNo <= A + B && img) {            // the state the previous frame left
+            int k = frameNo - A - 1;
+            hw[pass][k] = ctFnv32(g_ssh.wram, 0x20000); hf[pass][k] = ctFnv32(fb, (size_t)CAMW * CAMH * 3);
+            { uint8_t* ab; int an; ha[pass][k] = 0;                  // the sound processor too: SPC700 + DSP + ARAM, as the state sees them
+              if (audio && CtAudioStateSave(audio, &ab, &an)) { ha[pass][k] = ctFnv32(ab, (size_t)an); free(ab); } }
+            if (pass == 0 && w1) memcpy(w1 + (size_t)k * 0x20000, g_ssh.wram, 0x20000);
+            if (pass == 0 && f1 && k < 120) memcpy(f1 + (size_t)k * CAMW * CAMH * 3, fb, (size_t)CAMW * CAMH * 3);
+            if (k == 0 && getenv("CT_SS_DIFF") && atoi(getenv("CT_SS_DIFF")) == 2) {      // CT_SS_DIFF=2: compare the two runs one frame after the load instead
+              if (pass == 0) { char* sp = NULL;
+#if defined(__x86_64__)
+                               __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+#endif
+                               if (sp) ssDiffCapture((char*)__builtin_frame_address(0), sp); }
+              else ssDiffReport(); }
+            if (pass == 1 && (hw[0][k] != hw[1][k] || hf[0][k] != hf[1][k] || ha[0][k] != ha[1][k])) {
+              int at = -1; for (int i = 0; i < 0x20000 && w1; i++) if (w1[(size_t)k * 0x20000 + i] != g_ssh.wram[i]) { at = i; break; }
+              printf("ssroundtrip: DIVERGES %d frame(s) after the load: sound %s, WRAM %s, picture %s; first WRAM byte $%05X (%s)\n", k + 1,
+                     ha[0][k] == ha[1][k] ? "same" : "DIFFERENT", hw[0][k] == hw[1][k] ? "same" : "DIFFERENT", hf[0][k] == hf[1][k] ? "same" : "DIFFERENT", at < 0 ? 0 : at,
+                     at < 0 ? "none" : at < 0x10000 ? "$7E" : "$7F");
+              if (hf[0][k] != hf[1][k] && f1 && k < 120) {                     // where the picture differs: the box round the differing pixels
+                int x0 = CAMW, y0 = CAMH, x1 = -1, y1 = -1; long nd = 0; const uint8_t* a0 = f1 + (size_t)k * CAMW * CAMH * 3;
+                for (int y = 0; y < CAMH; y++) for (int x = 0; x < CAMW; x++) if (memcmp(a0 + ((size_t)y * CAMW + x) * 3, fb + ((size_t)y * CAMW + x) * 3, 3)) { nd++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+                printf("ssroundtrip:   %ld pixels differ, in x %d..%d, y %d..%d\n", nd, x0, x1, y0, y1);
+                { const char* dp = getenv("CT_SS_DUMP");                         // CT_SS_DUMP=<prefix>: both pictures, <prefix>_first.ppm / _after.ppm
+                  if (dp) { const uint8_t* im[2] = { a0, fb }; const char* nm[2] = { "first", "after" };
+                    for (int q = 0; q < 2; q++) { char pth[300]; snprintf(pth, sizeof pth, "%s_%s.ppm", dp, nm[q]); FILE* pf = fopen(pth, "wb");
+                      if (pf) { fprintf(pf, "P6\n%d %d\n255\n", CAMW, CAMH); fwrite(im[q], 1, (size_t)CAMW * CAMH * 3, pf); fclose(pf); } } } }
+              }
+              if (at >= 0 && getenv("CT_SS_VERBOSE")) { int shown = 0; printf("ssroundtrip:   differing WRAM bytes (offset first/after):");
+                for (int i = 0; i < 0x20000 && shown < 40; i++) if (w1[(size_t)k * 0x20000 + i] != g_ssh.wram[i]) { printf(" %05X:%02X/%02X", i, w1[(size_t)k * 0x20000 + i], g_ssh.wram[i]); shown++; }
+                printf("\n"); }
+              if (at >= 0) printf("ssroundtrip:   first run %02X, after the load %02X; $F0..$FF first: %02X%02X%02X%02X.. then: %02X%02X%02X%02X..\n", w1[(size_t)k * 0x20000 + at], g_ssh.wram[at], w1[(size_t)k * 0x20000 + 0xF0], w1[(size_t)k * 0x20000 + 0xF1], w1[(size_t)k * 0x20000 + 0xF2], w1[(size_t)k * 0x20000 + 0xF3], g_ssh.wram[0xF0], g_ssh.wram[0xF1], g_ssh.wram[0xF2], g_ssh.wram[0xF3]);
+              done = 1; running = 0;
+            }
+          }
+          if (!done && frameNo == A && !img) {
+            const char* why = NULL;
+            if (CtSsSaveImage(CtSsDefault(), &img, &imgLen, &why)) { printf("ssroundtrip: not saved at frame %d: %s\n", A, why); done = 1; running = 0; }
+            else { { uint8_t* ab; int an; g_ssAudioAtSave = 0; if (audio && CtAudioStateSave(audio, &ab, &an)) { g_ssAudioAtSave = ctFnv32(ab, (size_t)an); free(ab); } }
+                   printf("ssroundtrip: saved %zu bytes at frame %d (menuPhase %d screen %d, battle %d, world %d, fade %d, seq %d%s)\n", imgLen, A, menuPhase, menuScreen, battlePhase, inWorld, fade, seqOpen, seqX || gwX ? " +stage" : "");
+                   if ((getenv("CT_SS_DIFF") && atoi(getenv("CT_SS_DIFF")) == 1) || getenv("CT_SS_FULLRESTORE")) { char* sp = NULL;
+#if defined(__x86_64__)
+                                     __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+#endif
+                                     if (sp) ssDiffCapture((char*)__builtin_frame_address(0), sp); } }
+          }
+          if (!done && frameNo == A + B && img) {
+            if (pass == 0) {
+              const char* why = NULL; int part = 0;
+              if (CtSsLoadImage(CtSsDefault(), img, imgLen, &why, &part)) { printf("ssroundtrip: load failed: %s\n", why); done = 1; running = 0; }
+              else { pass = 1;
+                     { uint8_t* ab; int an; uint32_t hl = 0; if (audio && CtAudioStateSave(audio, &ab, &an)) { hl = ctFnv32(ab, (size_t)an); free(ab); }
+                       printf("ssroundtrip: the sound processor right after the load %s the state saved\n", hl == g_ssAudioAtSave ? "EQUALS" : "DIFFERS from"); }
+                     fieldSsResync(&f);
+                     if (getenv("CT_SS_FULLRESTORE")) {                                      // (diagnostic: the harness's own variables ride through it on the heap)
+                       struct { int A, B, pass, done, bound; uint8_t *img, *w1, *f1; size_t imgLen; uint32_t hw[2][600], hf[2][600], ha[2][600]; } *hk = malloc(sizeof *hk);
+                       hk->A = A; hk->B = B; hk->pass = pass; hk->done = done; hk->bound = ssBound; hk->img = img; hk->w1 = w1; hk->f1 = f1; hk->imgLen = imgLen;
+                       memcpy(hk->hw, hw, sizeof hw); memcpy(hk->hf, hf, sizeof hf); memcpy(hk->ha, ha, sizeof ha);
+                       ssFullRestore(getenv("CT_SS_FULLRESTORE"));
+                       A = hk->A; B = hk->B; pass = hk->pass; done = hk->done; ssBound = hk->bound; img = hk->img; w1 = hk->w1; f1 = hk->f1; imgLen = hk->imgLen;
+                       memcpy(hw, hk->hw, sizeof hw); memcpy(hf, hk->hf, sizeof hf); memcpy(ha, hk->ha, sizeof ha); free(hk); }
+                     if (getenv("CT_SS_DIFF") && atoi(getenv("CT_SS_DIFF")) == 1) ssDiffReport(); }
+            } else {
+              printf("ssroundtrip: %d frames after the load are identical to the first run (sound + WRAM + picture): MATCH%s\n", B, ha[0][0] ? "" : "  [!! NO SOUND STATE HASHED: the audio is not up]");
+              done = 1; running = 0;
+            }
+          }
+        }
+        fflush(stdout);
+      }
+      fieldSaveStateRun();                                 // a request from the menus runs here, between two whole frames
+    }
     // CT_OVERLAY_SHOT=<out.bmp>[@frame][:tab] (probe): at that frame (default 60) draw the overlay over the picture on
     // tab 0..3, save the window as a BMP and leave -- how the overlay is checked headless (SDL_VIDEODRIVER=dummy).
     { static int tg = -1; if (tg < 0) tg = getenv("CT_ASYNC_TOGGLE_TEST") != NULL;   // (check) the render thread handed back and forth, as the options menu does
@@ -11478,6 +11951,10 @@ int main(int argc, char** argv) {
           CtPresentSetAsync(pr, 0);                       // (the probe draws on this thread)
           if (g_lastShown) hostUploadPictureAt(pr, g_lastShown, g_lastShownW, 256, 0); else hostUploadPicture(pr, fb);
           if (tab == 9) hostDrawPicture(pr);             // (:9 -- the picture alone, no overlay)
+          else if (tab >= 10) {                          // :10 the save/load state menu; :11 its restore list, :12 a save confirmation, :13 the restore confirmation
+            CtStateMenuOpen(); if (tab > 10) CtStateMenuDebugPopup(tab - 10);
+            for (int i = 0; i < 6; i++) { CtStateMenuFrame(); hostDrawPicture(pr); CtOverlayRender(); }
+          }
           else for (int i = 0; i < 3; i++) { CtOverlaySelectTab(tab); CtOverlayFrame(); hostDrawPicture(pr); CtOverlayRender(); }
           int ow, oh; CtPresentOutputSize(pr, &ow, &oh);
           CtPresentSaveBMP(pr, path);
@@ -12169,7 +12646,14 @@ int main(int argc, char** argv) {
     }
     // The frame's controller word -- the one the oracle is handed below, on either side of the hop -- and the
     // NMI's pad latch made from it (fieldPadNmi: C2/84D2, one frame behind, as on the console).
-    const uint16_t padSerial = fieldLockInputBits(walkScript || playScript, wsDx, wsDy, talkPressed, wsB, wsStart, wsMenu, frameNo);
+    // CT_SS_ROUNDTRIP drives the lead from the FRAME NUMBER alone (a script's own cursor is host state a restored game would not rewind):
+    // right, down, left, up, right again, then a pause, over a 200-frame cycle.
+    if (dbg.ssRound && !walkScript && !playScript && !inLoadFade && !fieldResume) {       // (a --walkscript is itself a function of the frame number: it drives instead)
+      int c = frameNo % 200; wsDx = wsDy = 0;
+      if (c >= 20 && c < 60) wsDx = 1; else if (c >= 60 && c < 90) wsDy = 1; else if (c >= 90 && c < 130) wsDx = -1;
+      else if (c >= 130 && c < 160) wsDy = -1; else if (c >= 160 && c < 190) wsDx = 1;
+    }
+    const uint16_t padSerial = fieldLockInputBits(walkScript || playScript || dbg.ssRound, wsDx, wsDy, talkPressed, wsB, wsStart, wsMenu, frameNo);
 
     // ---- X-BUTTON MENU entry. TWO POLLS, ONE MENU -- because the ROM has two modules and ONE menu
     // program: both reach it through `JSL $C2:8000` with A = 1 (the five call sites in the whole ROM
@@ -12477,7 +12961,7 @@ int main(int argc, char** argv) {
         else if (wtT < 80) wDown = 1;
         else if (wtT < 88) wLeft = 1;
         if (wtT == 110) talkPressed = 1;
-      } else if (walkScript || playScript) {           // the headless drive, parsed above the mode split
+      } else if (walkScript || playScript || dbg.ssRound) {           // the headless drive, parsed above the mode split
         wUp = wsDy < 0; wDown = wsDy > 0; wLeft = wsDx < 0; wRight = wsDx > 0;
       } else {
         uint16_t kp = fieldKeyPad();
@@ -15813,13 +16297,11 @@ int main(int argc, char** argv) {
         tbStrLen = 0;
         tbStr = (tbTable >= 0) ? CtAssetString(&assets, CT_ASSET_DIALOGUE, (uint32_t)tbTable, tbIndex, &tbStrLen) : NULL;
         if (chestBox) { tbStr = g_chestMsg; tbStrLen = g_chestMsgLen; }   // $DE:FF00 entry, already decoded
-        static char tbConvBuf[4096];
         if (tbStr) { tbStrLen = tbConvert(tbStr, tbStrLen, tbConvBuf, sizeof tbConvBuf); tbStr = tbConvBuf; }
         // Substitute the character-NAME variables before layout: the dialogue carries name
         // markers ('\x01'+code, see assets/text.py) for the CT control codes 0x13-0x20; expand
         // them to the live names from the engine's name table (party codes 0x1B-0x1D read the
         // active party), exactly as the ROM's text decoder does at render time.
-        static char tbNameBuf[4096];
         if (tbStr) { tbStrLen = CtResolveNames(tbConvBuf, tbStrLen, tbNameBuf, sizeof tbNameBuf, f.vm); tbStr = tbNameBuf; }
         if (tbStr && dbg.tbText) { fprintf(stderr, "[tbtext] '%.*s'\n", tbStrLen, tbStr); }  // probe: resolved box text
         // a decision box pages only at a page code (the prompt pages, then the options page with the
@@ -16692,7 +17174,7 @@ int main(int argc, char** argv) {
       // the way the cartridge gets them, through whatever the Config screen mapped Dash to. MEASURED, the logical
       // oracle from saves/truce_market.state holding B+Down: $00F8 = 0A (Dash + Cancel), $1D33 = 20; B released, 10.
       { const uint8_t* pl = CtSceneMem7E(f.vm); crun = pl && (pl[0x00F8] & 0x02) != 0; }
-      if (walkScript || playScript) { cdx = wsDx; cdy = wsDy; }   // (both fill wsDx/wsDy above; no selftest gate)
+      if (walkScript || playScript || dbg.ssRound) { cdx = wsDx; cdy = wsDy; }   // (both fill wsDx/wsDy above; no selftest gate)
     }
     // field_camera_unification.md G.1.2: capture the lead's START-of-frame foot + this frame's post-
     // collision scroll request, both handed to the VM camera tick (CtSceneCameraInput) before CtSceneTick.
@@ -17714,7 +18196,7 @@ int main(int argc, char** argv) {
       int o2x, o2y, o3x, o3y; CtSceneLayerOffsetsOf(f.vm, pg, &o2x, &o2y, &o3x, &o3y);
       layerMoved = CtFieldSceneSetLayerOffsets(f.sd, o2x, o2y, o3x, o3y, pg[0x1D35]);
     }
-    int bgDirty = layerMoved;
+    int bgDirty = layerMoved || g_ssForceBake; g_ssForceBake = 0;     // (a loaded state: the picture is baked again from what it restored)
     // The FIELD's frames only: the battle's page is its own (battle.c draws its fades and flashes from it through its
     // own factors), and the menu and the overworld are other programs.
     int fieldNmi = f.sd && f.vm && !battlePhase && !inWorld && !menuPhase;

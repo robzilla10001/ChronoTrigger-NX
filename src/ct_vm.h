@@ -451,6 +451,11 @@ int  CtSceneActorScripted(const CtScene* sc, int i); // 1 = a called/scripted fn
 int  CtSceneActorMode(const CtScene* sc, int i);     // $1100 move-mode probe (debug)
 int  CtSceneSaveState(const CtScene* sc, const char* path, const double player[4]);  // DEBUG: snapshot the scene + the field player state {px,py,pz,pfac} (ct_field F5)
 int  CtSceneLoadState(CtScene* sc, const char* path, double player[4]);  // DEBUG: restore (F9); same-scene only. 0=fail, 1=VM only (old/no player), 2=VM+player[] restored
+// The save-state framework's memory view (savestate.h): the struct without the host's pointers; restore keeps the live ones. The WRAM image is a chunk of its own.
+size_t CtSceneSnapshotSize(void);
+int  CtSceneSnapshot(const CtScene* sc, uint8_t* dst);                       // dst: CtSceneSnapshotSize() bytes; 1 = ok
+int  CtSceneSnapshotFits(const CtScene* sc, const uint8_t* src, size_t n);   // 1 = it would restore onto this scene (no side effects)
+int  CtSceneRestoreSnapshot(CtScene* sc, const uint8_t* src, size_t n);      // 1 = restored
 void CtSceneAnimFinished(CtScene* sc, int i);       // renderer: the once-anim of actor i ended
 void CtSceneChoose(CtScene* sc, int option);   // pick option N: set the owner's `result` (op 0x1A) + dismiss
 void CtSceneGetFlags(const CtScene* sc, uint8_t* out0x200);  // copy the live $7F0000 story flags (door carry)

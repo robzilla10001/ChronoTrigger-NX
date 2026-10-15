@@ -315,6 +315,34 @@ int CtXlatHdmaBuild(const uint8_t* rom, long romLen, uint8_t* wram128) {
   return 0;
 }
 
+// ---- the SAVE-STATE FRAMEWORK's view of a stage (savestate.h, field.c STGE): the whole vendored machine (CPU, PPU, DMA, WRAM, the SPC it runs on, the pads) through
+// snes_saveState, and the stage's own bookkeeping. The program and the ROM are not state: a stage of the same entry is opened first (CtXlatStageOpen), then this is
+// loaded into it. Layout: u32 magic, u32 size of the machine's state, then frame0 stopFrame inFrame done rule (u32 each), then the machine's state.
+#define XST_MAGIC 0x31545358u      /* 'XST1' */
+size_t CtXlatStageStateSize(CtXlatStage* st) { return st ? 8 + 5 * 4 + (size_t)snes_saveState(st->hw, NULL) : 0; }
+int CtXlatStageStateSave(CtXlatStage* st, uint8_t* dst) {
+  if (!st) return 0;
+  int n = snes_saveState(st->hw, NULL);
+  uint32_t h[7] = { XST_MAGIC, (uint32_t)n, st->frame0, st->stopFrame, (uint32_t)st->inFrame, (uint32_t)st->done, (uint32_t)st->rule };
+  memcpy(dst, h, sizeof h);
+  return snes_saveState(st->hw, dst + sizeof h) == n;
+}
+int CtXlatStageStateFits(CtXlatStage* st, const uint8_t* src, size_t n) {
+  if (!st || n < 28) return 0;
+  uint32_t h[2]; memcpy(h, src, 8);
+  return h[0] == XST_MAGIC && n == 28 + (size_t)h[1] && (int)h[1] == snes_saveState(st->hw, NULL);
+}
+int CtXlatStageStateLoad(CtXlatStage* st, const uint8_t* src, size_t n) {
+  if (!CtXlatStageStateFits(st, src, n)) return 0;
+  uint32_t h[7]; memcpy(h, src, sizeof h);
+  uint8_t* copy = (uint8_t*)malloc(h[1]); if (!copy) return 0;
+  memcpy(copy, src + sizeof h, h[1]);
+  int ok = snes_loadState(st->hw, copy, (int)h[1]);
+  free(copy);
+  if (!ok) return 0;
+  st->frame0 = h[2]; st->stopFrame = h[3]; st->inFrame = (int)h[4]; st->done = (int)h[5]; st->rule = (int)h[6];
+  return 1;
+}
 Snes* CtXlatStageHardware(CtXlatStage* st) { return st ? st->hw : NULL; }
 void CtXlatStageSetRule(CtXlatStage* st, int on) { if (st) { st->rule = on; if (on) snes_logicalFresh(); } }
 const uint8_t* CtXlatStageWram(const CtXlatStage* st) { return st ? st->hw->ram : NULL; }

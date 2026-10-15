@@ -47,6 +47,7 @@ void CtSettingsDefaults(CtSettings* s) {
   s->sync = CT_SYNC_FRAME_PERFECT;
   s->statsHud = 0;
   s->clocks = -1;
+  s->statesBackup = 1; s->statesConfirm = 1;      // the save/load menu: keep the old state as .bak, and ask before a save / load
 }
 
 CtSettings* CtSettingsGet(void) {
@@ -108,6 +109,9 @@ static void setKey(CtSettings* s, const char* sec, const char* key, const char* 
       else if (!strcmp(key, k2)) s->keys[b][1] = *val ? (int)SDL_GetScancodeFromName(val) : 0;
       else if (!strcmp(key, kp)) s->pad[b] = *val ? (int)SDL_GameControllerGetButtonFromString(val) : -1;
     }
+  } else if (!strcmp(sec, "states")) {
+    if (!strcmp(key, "backup")) s->statesBackup = iv != 0;
+    else if (!strcmp(key, "confirm")) s->statesConfirm = iv != 0;
   } else if (!strcmp(sec, "timing")) {
     if (!strcmp(key, "sync")) s->sync = !strcmp(val, "free") ? CT_SYNC_FREE : CT_SYNC_FRAME_PERFECT;
   }
@@ -130,6 +134,9 @@ int CtSettingsLoad(int interactive) {
     setKey(s, sec, trim(p), trim(eq + 1));
   }
   fclose(f);
+#ifdef __SWITCH__
+  s->fullscreen = 1;                                    // the console's screen is the whole screen: not an option there
+#endif
   return 1;
 }
 
@@ -154,6 +161,7 @@ int CtSettingsSave(void) {
     const char* pn = s->pad[b] >= 0 ? SDL_GameControllerGetStringForButton((SDL_GameControllerButton)s->pad[b]) : NULL;
     fprintf(f, "pad_%s=%s\n", BTN_KEY[b], pn ? pn : "");
   }
+  fprintf(f, "\n[states]\nbackup=%d\nconfirm=%d\n", s->statesBackup, s->statesConfirm);
   fprintf(f, "\n[timing]\nsync=%s\n", s->sync == CT_SYNC_FREE ? "free" : "frame_perfect");
   fclose(f);
   return 1;

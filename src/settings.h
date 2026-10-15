@@ -57,6 +57,9 @@ typedef struct CtSettings {
   // the host
   int clocks;                   // CT_CLK_* (Switch only); -1 = pick by hardware at first run
   int statsHud;                 // CT_HUD_*: the performance counters over the picture (hoststats.h); off by default
+  // the save/load state menu (ZL+ZR)
+  int statesBackup;             // a save first moves the slot's current file to state<N>.bak
+  int statesConfirm;            // a save / load asks "are you sure?" first
 } CtSettings;
 
 CtSettings* CtSettingsGet(void);                 // the live options (defaults until CtSettingsLoad)

@@ -8096,6 +8096,37 @@ int CtSceneLoadState(CtScene* sc, const char* path, double player[4]) {
   free(tmp); free(img);
   return 2;
 }
+// ---- the SAVE-STATE FRAMEWORK's view of the scene (savestate.h, savestate_engine.c): the struct without the host's pointers, in memory.
+// Same rule as the debug file above (CtSceneSaveState): the live pointers (the static scene data, the map hook, the host-owned WRAM) are
+// kept on restore, only the dynamic state goes back; the WRAM image is the framework's own chunk, not part of this one.
+size_t CtSceneSnapshotSize(void) { return sizeof(CtScene); }
+int CtSceneSnapshot(const CtScene* sc, uint8_t* dst) {
+  CtScene* cp = (CtScene*)malloc(sizeof(CtScene));
+  if (!cp) return 0;
+  memcpy(cp, sc, sizeof(CtScene));
+  cp->raw = NULL; cp->body = NULL; cp->tileSolid = NULL; cp->tileCtx = NULL; cp->mem = NULL;
+  memcpy(dst, cp, sizeof(CtScene));
+  free(cp);
+  return 1;
+}
+int CtSceneSnapshotFits(const CtScene* sc, const uint8_t* src, size_t n) {
+  if (n != sizeof(CtScene)) return 0;
+  CtScene* tmp = (CtScene*)malloc(sizeof(CtScene));
+  if (!tmp) return 0;
+  memcpy(tmp, src, sizeof(CtScene));
+  int ok = tmp->nobj == sc->nobj;                 // the same scene (same object count) -- the scene is loaded by the host before
+  free(tmp);
+  return ok;
+}
+int CtSceneRestoreSnapshot(CtScene* sc, const uint8_t* src, size_t n) {
+  if (!CtSceneSnapshotFits(sc, src, n)) return 0;
+  uint8_t* raw = sc->raw; const uint8_t* body = sc->body;
+  int (*ts)(void*, int, int) = sc->tileSolid; void* tc = sc->tileCtx;
+  Mem* mem = sc->mem; int own = sc->ownMem;
+  memcpy(sc, src, sizeof(CtScene));
+  sc->raw = raw; sc->body = body; sc->tileSolid = ts; sc->tileCtx = tc; sc->mem = mem; sc->ownMem = own;
+  return 1;
+}
 void CtSceneActorSetFacing(CtScene* sc, int i, int facing) {
   if (i >= 0 && i < sc->nobj) vmSetFacing(sc->mem, &sc->actors[i], i, facing);
 }

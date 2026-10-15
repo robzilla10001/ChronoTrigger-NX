@@ -16,6 +16,7 @@
 
 #define CT_BATTLE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 // Input bitmask routed into CtBattleTick's `input` arg while the field is in battlePhase (the field
@@ -1139,6 +1140,8 @@ const uint8_t* CtBattleStripVramLive(void);
 void CtBattleBegin(CtBattleHost* h);
 // A host hook for TIMING CtBattleBegin's stages (hoststats; NULL = none): called with 0 at the start, then 1..5 after each stage. Reads no state.
 extern void (*CtBattleLapHook)(int stage);
+// The battle module's own cross-frame variables, by name, for the save-state framework (savestate_engine.h CtSsVarAdd has this signature).
+void CtBattleStateVars(void (*add)(const char* name, void* p, size_t n));
 int  CtBattleTick(CtBattleHost* h, int endRequest, int input);
 int  CtBattleRun(CtBattleHost* h);
 

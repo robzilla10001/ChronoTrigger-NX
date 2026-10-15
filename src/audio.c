@@ -18,6 +18,7 @@
 
 #include "audio.h"
 #include "snes.h"
+#include "statehandler.h"
 #include "apu.h"
 #include "spc.h"
 #include "dsp.h"
@@ -1633,6 +1634,64 @@ void CtAudioSeedFromApu(CtAudio* a, const Apu* src) { audJoin();
   memcpy(dsp, src->dsp, sizeof *dsp); dsp->apu = d;
   a->ready = 1; a->cycleCarry = 0.0; a->mutedFrame = 0;
   audReset(a);
+}
+// ---- the SAVE-STATE FRAMEWORK's view of the sound (savestate.h, savestate_engine.c): the SPC700, the DSP and the 64 KB ARAM through the
+// vendored state handler, plus the clock's fractional carry. The output FIFO is not kept: a load starts it empty (a frame of silence, then
+// the restored song carries on), like CtAudioSeedFromApu. The loader parameters (engine mode, post line, the rule's) are set by the host
+// every frame and are not state.
+static const uint32_t kAudStateMagic = 0x32445541u;           // 'AUD2'
+// What the host has told the loader clock (engine mode, the post line, the rule's parameters, the HDMA channels it walks) and what the last clocked JSL left: set by events
+// (a battle begins, a scene loads), so a state carries them. hdma.wram is the host's image: a pointer, set again on a load.
+typedef struct { int engineMode, postLine, lastFrames, lastEndLine, mutedFrame, ruleNmiOff, ruleOff, ruleIrqLine; long lastPolls, rulePostAt, ruleNmiWait, lastRuleStart; long long lastMaster;
+                 int hProg, hOn, hNmiOn, hCutLine; LdHdmaCh hCh[8]; } AudLoaderState;
+int CtAudioStateSave(CtAudio* a, uint8_t** out, int* len) {
+  audJoin();
+  *out = NULL; *len = 0;
+  if (!a || !a->apu || !a->ready) return 0;
+  StateHandler* sh = sh_init(true, NULL, 0);
+  if (!sh) return 0;
+  apu_handleState(a->apu, sh);
+  int n = sh->offset;
+  AudLoaderState L; memset(&L, 0, sizeof L);
+  L.engineMode = a->engineMode; L.postLine = a->postLine; L.lastFrames = a->lastFrames; L.lastEndLine = a->lastEndLine; L.mutedFrame = a->mutedFrame; L.ruleNmiOff = a->ruleNmiOff;
+  L.ruleOff = a->ruleOff; L.ruleIrqLine = a->ruleIrqLine; L.lastPolls = a->lastPolls; L.rulePostAt = a->rulePostAt; L.ruleNmiWait = a->ruleNmiWait; L.lastRuleStart = a->lastRuleStart;
+  L.lastMaster = a->lastMaster; L.hProg = a->hdma.prog; L.hOn = a->hdma.on; L.hNmiOn = a->hdma.nmiOn; L.hCutLine = a->hdma.cutLine; memcpy(L.hCh, a->hdma.ch, sizeof L.hCh);
+  uint8_t* b = (uint8_t*)malloc((size_t)n + 16 + sizeof L);
+  if (!b) { sh_free(sh); return 0; }
+  memcpy(b, &kAudStateMagic, 4); memcpy(b + 4, &n, 4); memcpy(b + 8, &a->cycleCarry, 8);
+  memcpy(b + 16, sh->data, (size_t)n); memcpy(b + 16 + n, &L, sizeof L);
+  sh_free(sh);
+  *out = b; *len = n + 16 + (int)sizeof L;
+  return 1;
+}
+int CtAudioStateFits(const CtAudio* a, const uint8_t* d, int len) {
+  audJoin();
+  if (!a || !a->apu || len < 16) return 0;
+  uint32_t m; int n; memcpy(&m, d, 4); memcpy(&n, d + 4, 4);
+  if (m != kAudStateMagic || n < 0x10000 || n + 16 + (int)sizeof(AudLoaderState) != len) return 0;
+  // the stream's size is fixed for a build (no variable-length parts), so a save from this build has exactly this many bytes
+  StateHandler* sh = sh_init(true, NULL, 0);
+  if (!sh) return 0;
+  apu_handleState(a->apu, sh);
+  int want = sh->offset; sh_free(sh);
+  return want == n;
+}
+int CtAudioStateLoad(CtAudio* a, const uint8_t* d, int len, const uint8_t* wram128) {
+  audJoin();
+  if (!CtAudioStateFits(a, d, len)) return 0;
+  int n; memcpy(&n, d + 4, 4);
+  StateHandler* sh = sh_init(false, d + 16, n);
+  if (!sh) return 0;
+  apu_handleState(a->apu, sh);
+  sh_free(sh);
+  memcpy(&a->cycleCarry, d + 8, 8);
+  AudLoaderState L; memcpy(&L, d + 16 + n, sizeof L);
+  a->engineMode = L.engineMode; a->postLine = L.postLine; a->lastFrames = L.lastFrames; a->lastEndLine = L.lastEndLine; a->ruleNmiOff = L.ruleNmiOff; a->ruleOff = L.ruleOff;
+  a->ruleIrqLine = L.ruleIrqLine; a->lastPolls = L.lastPolls; a->rulePostAt = L.rulePostAt; a->ruleNmiWait = L.ruleNmiWait; a->lastRuleStart = L.lastRuleStart; a->lastMaster = L.lastMaster;
+  a->hdma.prog = L.hProg; a->hdma.on = L.hOn; a->hdma.nmiOn = L.hNmiOn; a->hdma.cutLine = L.hCutLine; memcpy(a->hdma.ch, L.hCh, sizeof L.hCh); a->hdma.wram = L.hProg ? wram128 : NULL;
+  a->mutedFrame = 0; a->ready = 1;
+  audReset(a);
+  return 1;
 }
 void CtAudioSetEngineMode(CtAudio* a, int mode) { if (a) a->engineMode = (mode >= 0 && mode <= 2) ? mode : 0; }   // 2 = the loader's quiet background
 void CtAudioSetPostLine(CtAudio* a, int vPos) { if (a) a->postLine = vPos; }

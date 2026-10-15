@@ -1,3 +1,4 @@
+#include <stddef.h>
 // scene.h — Chrono Trigger field-scene renderer (C engine).
 #ifndef CT_SCENE_H
 #define CT_SCENE_H
@@ -8,6 +9,11 @@
 // THE WINDOWED BAKE (scene.c): update the baked picture in place, only around the camera. See CtFieldSceneSetBakeWindow's comment.
 void CtFieldSceneSetBakeWindow(void* h, int vx0, int vy0, int vx1, int vy1, int m1, int m2, unsigned char* out, unsigned char* prio, int W, int H);
 int  CtFieldSceneBakeCovers(void* h);
+// The save-state framework's view of what the running scene has changed since it loaded (tile chips, palette, scroll, screen settings). Save: StateSize() bytes.
+size_t CtFieldSceneStateSize(void* h);
+int  CtFieldSceneStateSave(void* h, unsigned char* dst);
+int  CtFieldSceneStateFits(void* h, const unsigned char* src, size_t n);
+int  CtFieldSceneStateLoad(void* h, const unsigned char* src, size_t n);
 int  CtFieldSceneBakeWindowPieces(void* h, int out[4][4]);       // the last bake's pieces (up to 4 rectangles x0 y0 x1 y1); returns how many
 void CtSceneSetParallel(void (*parFor)(int n, int grain, void (*fn)(void*, int, int), void* ctx));
 

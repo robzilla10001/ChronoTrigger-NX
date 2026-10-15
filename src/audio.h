@@ -151,5 +151,9 @@ uint32_t       CtAudioAramFnv(const CtAudio* a);   // FNV-1a/32 over all of ARAM
 void           CtAudioPorts(const CtAudio* a, uint8_t in[4], uint8_t out[4]);
 int            CtAudioVoicesSounding(const CtAudio* a);   // DSP voices with gain != 0
 
+// The save-state framework's view (savestate.h): SPC700 + DSP + ARAM + the clock carry + what the host told the loader clock, to / from memory. Save mallocs *out (free it). Fits = no side effects.
+int  CtAudioStateSave(CtAudio* a, uint8_t** out, int* len);
+int  CtAudioStateFits(const CtAudio* a, const uint8_t* d, int len);
+int  CtAudioStateLoad(CtAudio* a, const uint8_t* d, int len, const uint8_t* wram128);   // wram128: the host's image (the loader clock's HDMA channels read it)
 extern void (*CtAudioJoinHook)(void);   // host: waits for the sound frame job (field.c); NULL = none
 #endif

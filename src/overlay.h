@@ -28,6 +28,18 @@ int  CtOverlayFrame(void);
 void CtOverlayRender(void);                               // draw it (after the host drew the game picture)
 void CtOverlaySetPadName(const char* name);               // the connected controller, or NULL
 void CtOverlaySelectTab(int tab);                         // (CT_OVERLAY_SHOT) open on tab 0..3 next frame
+
+// THE SAVE/LOAD STATE MENU (ZL + ZR): a second window of the same overlay, built for the touch screen -- large buttons, a slot list, a 2x2 grid:
+// save, load, back up every slot, restore a backup. The host runs it MODAL like the options (the game stands still). What it asks of the game goes
+// through savestate.h's request queue; the flag below asks the host to run that queue NOW (the game is between two frames), so the answer is on the menu at once.
+enum {
+  CT_SMENU_CLOSE   = 1,   // the player chose "Return to game"
+  CT_SMENU_SERVICE = 2,   // a save / load was queued: the host runs it before the next frame of the menu
+};
+void CtStateMenuOpen(void);                               // reset the menu (popups shut, message cleared) as it is shown
+int  CtStateMenuFrame(void);                              // build this frame's window; CT_SMENU_* flags (draw with CtOverlayRender)
+int  CtStateMenuPopupOpen(void);                          // 1 = a confirmation / list is on top: B closes that first, not the menu
+void CtStateMenuDebugPopup(int which);                    // (CT_OVERLAY_SHOT) 1 = the restore list, 2 = a save confirmation, 3 = the restore confirmation
 #ifdef __cplusplus
 }
 #endif

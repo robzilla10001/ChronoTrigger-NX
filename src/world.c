@@ -2415,3 +2415,10 @@ void CtWorldStreamFrame(CtWorldStream* st, CtWorldCam* c, uint8_t* ram, int dx, 
   // per-line wave are blocks of the same pass. CtWorldAmbientFrame runs all three in block order.
   c->leadDx = dx; c->leadDy = dy; c->leadStore = (dx || dy);
 }
+
+// The overworld's own cross-frame variables, by name, for the save-state framework (savestate_engine.h CtSsVarAdd has this signature): the NMI's latches and
+// the pass's suspension (an inline JSL holds it for the NMIs it crossed). The picture's records (g_owShown*, g_owNodeBlk, the OAM keys) are rewritten every frame.
+void CtWorldStateVars(void (*add)(const char* name, void* p, size_t n)) {
+  add("g_owNmiEn", &g_owNmiEn, sizeof g_owNmiEn); add("g_owNmiWh0", &g_owNmiWh0, sizeof g_owNmiWh0); add("g_owNmiWh1", &g_owNmiWh1, sizeof g_owNmiWh1);
+  add("g_owSuspendNmis", &g_owSuspendNmis, sizeof g_owSuspendNmis); add("g_owResumeBlock", &g_owResumeBlock, sizeof g_owResumeBlock);
+}

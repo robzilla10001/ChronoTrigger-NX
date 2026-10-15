@@ -22079,3 +22079,12 @@ int CtBattleRun(CtBattleHost* h) {
   }
   return h->glb[0x1EC];
 }
+
+// The save-state framework's view of the battle module's own cross-frame variables (savestate.h): handed to `add` by name. The per-frame products (the line cuts, the
+// compositor's rows, its front mask) are rewritten every frame and are not state; what carries over from one frame to the next is.
+void CtBattleStateVars(void (*add)(const char* name, void* p, size_t n)) {
+  add("gBattleFxFixCarry", &gBattleFxFixCarry, sizeof gBattleFxFixCarry);
+  add("gBattleNmiLine", &gBattleNmiLine, sizeof gBattleNmiLine); add("gBattleNmiPad", &gBattleNmiPad, sizeof gBattleNmiPad);
+  add("gBattleLineCutOn", &gBattleLineCutOn, sizeof gBattleLineCutOn); add("gBattleLineAt", &gBattleLineAt, sizeof gBattleLineAt);
+  add("gBattleFxCutN", &gBattleFxCutN, sizeof gBattleFxCutN); add("gBattleFxCutLine", gBattleFxCutLine, sizeof gBattleFxCutLine);
+}

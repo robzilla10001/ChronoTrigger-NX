@@ -858,6 +858,45 @@ int CtFieldSceneBakeWindowPieces(void* h, int out[4][4]) {
   return sd->pwHaveN;
 }
 
+// ---- the SAVE-STATE FRAMEWORK's view of the scene's picture data (savestate.h, field.c SDAT): what the running scene has changed since it was loaded -- the decoded
+// tile chips (the tile animations DMA new ones in), the palette (its animation edits it in place), the layer scroll offsets and screen settings. The static
+// data (the maps' structure, the metatile tables, the animation descriptors) comes from loading the scene again.
+size_t CtFieldSceneStateSize(void* h) {
+  SceneData* sd = (SceneData*)h; if (!sd || !sd->chips12) return 0;
+  return 768 * 64 + 768 + 2 * sizeof sd->pal + sizeof(int) * 24 + (size_t)sd->nchips3 * 65;
+}
+int CtFieldSceneStateSave(void* h, uint8_t* dst) {
+  SceneData* sd = (SceneData*)h; if (!sd || !sd->chips12) return 0;
+  uint8_t* p = dst;
+  memcpy(p, sd->chips12, 768 * 64); p += 768 * 64; memcpy(p, sd->pres12, 768); p += 768;
+  memcpy(p, sd->pal, sizeof sd->pal); p += sizeof sd->pal; memcpy(p, sd->basePal, sizeof sd->basePal); p += sizeof sd->basePal;
+  int v[24] = { sd->animFrame, sd->l2ox, sd->l2oy, sd->l3ox, sd->l3oy, sd->scrOn, sd->scrCGWSEL, sd->scrCGADSUB, sd->scrTM, sd->scrTS, sd->scrObjM, sd->scrObjS,
+                sd->mapBuilt, sd->vramOff, sd->md1, sd->md2, sd->md3, sd->haveMdScroll, sd->sm_l, sd->sm_t, sd->sm_r, sd->sm_b, sd->sm_full, sd->nchips3 };
+  memcpy(p, v, sizeof v); p += sizeof v;
+  if (sd->chips3 && sd->nchips3 > 0) { memcpy(p, sd->chips3, (size_t)sd->nchips3 * 64); p += (size_t)sd->nchips3 * 64; memcpy(p, sd->pres3, (size_t)sd->nchips3); p += sd->nchips3; }
+  return 1;
+}
+int CtFieldSceneStateFits(void* h, const uint8_t* src, size_t n) {
+  SceneData* sd = (SceneData*)h; if (!sd || !sd->chips12 || n < 768 * 64 + 768 + 2 * sizeof sd->pal + sizeof(int) * 24) return 0;
+  int nc3 = 0; memcpy(&nc3, src + 768 * 64 + 768 + 2 * sizeof sd->pal + sizeof(int) * 23, sizeof nc3);
+  return nc3 == sd->nchips3 && n == CtFieldSceneStateSize(h);
+}
+int CtFieldSceneStateLoad(void* h, const uint8_t* src, size_t n) {
+  SceneData* sd = (SceneData*)h; if (!CtFieldSceneStateFits(h, src, n)) return 0;
+  const uint8_t* p = src;
+  memcpy(sd->chips12, p, 768 * 64); p += 768 * 64; memcpy(sd->pres12, p, 768); p += 768;
+  memcpy(sd->pal, p, sizeof sd->pal); p += sizeof sd->pal; memcpy(sd->basePal, p, sizeof sd->basePal); p += sizeof sd->basePal;
+  int v[24]; memcpy(v, p, sizeof v); p += sizeof v;
+  sd->animFrame = v[0]; sd->l2ox = v[1]; sd->l2oy = v[2]; sd->l3ox = v[3]; sd->l3oy = v[4]; sd->scrOn = v[5]; sd->scrCGWSEL = v[6]; sd->scrCGADSUB = v[7]; sd->scrTM = v[8];
+  sd->scrTS = v[9]; sd->scrObjM = v[10]; sd->scrObjS = v[11]; sd->mapBuilt = (uint8_t)v[12]; sd->vramOff = (uint8_t)v[13]; sd->md1 = (uint8_t)v[14]; sd->md2 = (uint8_t)v[15];
+  sd->md3 = (uint8_t)v[16]; sd->haveMdScroll = v[17]; sd->sm_l = v[18]; sd->sm_t = v[19]; sd->sm_r = v[20]; sd->sm_b = v[21]; sd->sm_full = v[22];
+  if (sd->chips3 && sd->nchips3 > 0) { memcpy(sd->chips3, p, (size_t)sd->nchips3 * 64); p += (size_t)sd->nchips3 * 64; memcpy(sd->pres3, p, (size_t)sd->nchips3); }
+  if (sd->prevChips) memcpy(sd->prevChips, sd->chips12, 768 * 64);
+  sd->layDirty = 1;
+  sd->pwHaveOk = 0;                                  // (the windowed bake's destination no longer describes the picture: the next bake is a full one)
+  return 1;
+}
+
 uint8_t* CtFieldSceneBake(void* h, int* outW, int* outH, uint8_t** outPrioMask) {
   SceneData* sd = (SceneData*)h;
   int W = 0, H = 0; sceneCanvasSize(sd, &W, &H);

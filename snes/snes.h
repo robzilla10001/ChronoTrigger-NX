@@ -2,6 +2,7 @@
 #ifndef SNES_H
 #define SNES_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -101,6 +102,8 @@ void snes_setSamples(Snes* snes, int16_t* sampleData, int samplesPerFrame);
 int snes_saveBattery(Snes* snes, uint8_t* data);
 bool snes_loadBattery(Snes* snes, uint8_t* data, int size);
 int snes_saveState(Snes* snes, uint8_t* data);
+// The logical-frame machinery's cross-frame variables, by name, for the save-state framework.
+void snes_stateVars(void (*add)(const char* name, void* p, size_t n));
 bool snes_loadState(Snes* snes, uint8_t* data, int size);
 
 #endif

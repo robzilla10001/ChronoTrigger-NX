@@ -979,3 +979,59 @@ void snes_runSpcCycle(Snes* snes) {
   // TODO: apu catchup is not aware of this, SPC runs extra cycle(s)
   spc_runOpcode(snes->apu->spc);
 }
+
+// The save-state framework's view of the logical-frame machinery's own variables (savestate.h): handed to `add` by name. A translated stage runs under it, and what it carries
+// from one frame to the next (the interrupt bookkeeping, the stretch and hold accounting, the line cuts' serials) is part of where that stage is.
+void snes_stateVars(void (*add)(const char* name, void* p, size_t n)) {
+  add("g_cycTag", &g_cycTag, sizeof g_cycTag);
+  add("g_cycTagCycles", &g_cycTagCycles, sizeof g_cycTagCycles);
+  add("lfApuNow", &lfApuNow, sizeof lfApuNow);
+  add("lfRing", &lfRing, sizeof lfRing);
+  add("lfPos", &lfPos, sizeof lfPos);
+  add("lfFill", &lfFill, sizeof lfFill);
+  add("lfWroteNow", &lfWroteNow, sizeof lfWroteNow);
+  add("lfHoldNow", &lfHoldNow, sizeof lfHoldNow);
+  add("lfNoHoldFrame", &lfNoHoldFrame, sizeof lfNoHoldFrame);
+  add("lfRollbackPending", &lfRollbackPending, sizeof lfRollbackPending);
+  add("lfRingSnap", &lfRingSnap, sizeof lfRingSnap);
+  add("lfPosSnap", &lfPosSnap, sizeof lfPosSnap);
+  add("lfFillSnap", &lfFillSnap, sizeof lfFillSnap);
+  add("lfIfast", &lfIfast, sizeof lfIfast);
+  add("lfWaitingNow", &lfWaitingNow, sizeof lfWaitingNow);
+  add("lfWaitLo", &lfWaitLo, sizeof lfWaitLo);
+  add("lfWaitHi", &lfWaitHi, sizeof lfWaitHi);
+  add("g_ctIfastHeld", &g_ctIfastHeld, sizeof g_ctIfastHeld);
+  add("lfIfastRun", &lfIfastRun, sizeof lfIfastRun);
+  add("lfVbIfast", &lfVbIfast, sizeof lfVbIfast);
+  add("g_ctLogicalCrossed", &g_ctLogicalCrossed, sizeof g_ctLogicalCrossed);
+  add("lfIntDepth", &lfIntDepth, sizeof lfIntDepth);
+  add("lfIntSp", &lfIntSp, sizeof lfIntSp);
+  add("lfRdnmi", &lfRdnmi, sizeof lfRdnmi);
+  add("lfRdnmiMain", &lfRdnmiMain, sizeof lfRdnmiMain);
+  add("lfRdnmiArmed", &lfRdnmiArmed, sizeof lfRdnmiArmed);
+  add("lfAcctInit", &lfAcctInit, sizeof lfAcctInit);
+  add("lfAcctCycles", &lfAcctCycles, sizeof lfAcctCycles);
+  add("lfAcctRefresh", &lfAcctRefresh, sizeof lfAcctRefresh);
+  add("lfAcctHdma", &lfAcctHdma, sizeof lfAcctHdma);
+  add("lfStretch", &lfStretch, sizeof lfStretch);
+  add("lfCrossed", &lfCrossed, sizeof lfCrossed);
+  add("lfPrevPc", &lfPrevPc, sizeof lfPrevPc);
+  add("lfIntSerial", &lfIntSerial, sizeof lfIntSerial);
+  add("lfStretchOn", &lfStretchOn, sizeof lfStretchOn);
+  add("lfStretchPc", &lfStretchPc, sizeof lfStretchPc);
+  add("lfStretchFrame", &lfStretchFrame, sizeof lfStretchFrame);
+  add("g_ctLineHeld", &g_ctLineHeld, sizeof g_ctLineHeld);
+  add("lfLineHold", &lfLineHold, sizeof lfLineHold);
+  add("lfLine64", &lfLine64, sizeof lfLine64);
+  add("g_ctLineCutAt", &g_ctLineCutAt, sizeof g_ctLineCutAt);
+  add("g_ctLineCutN", &g_ctLineCutN, sizeof g_ctLineCutN);
+  add("g_ctLineCutSeq", &g_ctLineCutSeq, sizeof g_ctLineCutSeq);
+  add("lfLineCutSerial", &lfLineCutSerial, sizeof lfLineCutSerial);
+  add("lfVbCycles", &lfVbCycles, sizeof lfVbCycles);
+  add("lfVbRefresh", &lfVbRefresh, sizeof lfVbRefresh);
+  add("lfPhaseHold", &lfPhaseHold, sizeof lfPhaseHold);
+  add("lfPhasePending", &lfPhasePending, sizeof lfPhasePending);
+  add("g_ctDrainVbK", &g_ctDrainVbK, sizeof g_ctDrainVbK);
+  add("g_ctDrainVbHi", &g_ctDrainVbHi, sizeof g_ctDrainVbHi);
+  add("g_ctDrainVbV", &g_ctDrainVbV, sizeof g_ctDrainVbV);
+}

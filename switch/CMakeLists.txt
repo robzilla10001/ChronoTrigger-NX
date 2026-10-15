@@ -13,7 +13,7 @@ file(GLOB SNES_SRC CONFIGURE_DEPENDS ${ROOT}/snes/*.c)
 file(GLOB XLAT_SRC CONFIGURE_DEPENDS ${ROOT}/src/xlat/*.c)
 set(CT_SRC field scene lz assets ct_vm collision player world battle objslot tileanim menu menu_cost field_cost oam
     settings present hoststats hostpool motion fieldnative move audio title_intro seq_ppu seq_xlat ct_cpu_infra rom_verify ct_lake_state
-    switch_platform)
+    switch_platform savestate savestate_engine)
 list(TRANSFORM CT_SRC PREPEND ${ROOT}/src/)
 list(TRANSFORM CT_SRC APPEND .c)
 set(IMGUI ${ROOT}/third_party/imgui)

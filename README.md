@@ -166,5 +166,5 @@ Make a folder on the SD card, `sdmc:/switch/ChronoTrigger-NX/`, and copy three f
 Start it from the Homebrew Menu in **application mode** (hold **R** while launching a game, then pick it), for the
 full memory and CPU budget. The save (`ct_sram.srm`), `ct_settings.ini` and the log appear in the same folder.
 **L3 + R3** (press both sticks) opens the mods menu, including the Switch's clock profile; the defaults give the
-vanilla game at 256x224. For the controls, the clock profiles, the performance HUD and the report files see
+vanilla game at 256x224. **ZL + ZR** opens the save/load state menu ([docs/SAVESTATES.md](docs/SAVESTATES.md)). For the controls, the clock profiles, the performance HUD and the report files see
 [docs/SWITCH.md](docs/SWITCH.md).

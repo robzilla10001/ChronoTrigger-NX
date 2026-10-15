@@ -52,6 +52,11 @@ live, and the picture's sizes: `RENDER WxH` (the uploaded picture: 256x224 x the
 rectangle it is drawn in, and the window's output), with the options that make them; `ct_stats.txt` has the full line: `cpu <MHz> bench <us> core<N> [<c0> <c1> <c2>] re=<re-asserts> ev=<applet events> fb=<fallbacks>
 rc=<last result>` (`bench` is a fixed loop: ~610 us boosted, ~1175 us at 1020 MHz).
 
+## The save/load state menu (ZL + ZR)
+
+Squeeze both triggers to pause the game and open a touch-first menu: ten save-state slots, backup and restore of all of them, and the options to keep the
+previous state as a `.bak` and to confirm before a save or load. States work everywhere; see [SAVESTATES.md](SAVESTATES.md).
+
 ## The mods menu (L3 + R3)
 
 The mods menu (widescreen, internal resolution, frames between, sync mode, controls, ...) is built into the Switch build with

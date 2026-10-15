@@ -13,6 +13,7 @@
 #ifndef CT_SEQ_XLAT_H
 #define CT_SEQ_XLAT_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "snes.h"
 #include "cpu.h"
@@ -205,5 +206,10 @@ long CtXlatStageFrames(const CtXlatStage* st);
 uint32_t CtXlatStageFailPc(const CtXlatStage* st);
 void CtXlatStageFailBytes(const CtXlatStage* st, uint8_t* want, uint8_t* got);   // a CT_XLAT_BADBYTES stop's first differing byte
 void CtXlatStageClose(CtXlatStage* st);
+// The save-state framework's view of a stage (open a stage of the same entry first): the machine and the stage's bookkeeping, to / from memory.
+size_t CtXlatStageStateSize(CtXlatStage* st);
+int  CtXlatStageStateSave(CtXlatStage* st, uint8_t* dst);                          // dst: StateSize() bytes; 1 = ok
+int  CtXlatStageStateFits(CtXlatStage* st, const uint8_t* src, size_t n);          // 1 = it would load into this stage (no side effects)
+int  CtXlatStageStateLoad(CtXlatStage* st, const uint8_t* src, size_t n);
 
 #endif
