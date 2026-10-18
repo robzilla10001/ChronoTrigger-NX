@@ -151,7 +151,7 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work dev
     'cmake -S switch -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake && cmake --build build-switch -j'
 ```
 
-The first build takes about nine minutes. The result is `build-switch/ct_field.nro` (about 11 MB).
+The first build takes about nine minutes. The result is `build-switch/ct_field.nro` (about 11 MB: SDL_Renderer, OpenGL and deko3d video backends). For the Vulkan backend (mesa-switch's NVK) and the second, all-new-Mesa configuration, see [docs/SWITCH.md](docs/SWITCH.md) (`switch/get_mesa.sh`, `switch/build_both.sh`).
 
 ### 5. Install it on the console
 
@@ -166,5 +166,5 @@ Make a folder on the SD card, `sdmc:/switch/ChronoTrigger-NX/`, and copy three f
 Start it from the Homebrew Menu in **application mode** (hold **R** while launching a game, then pick it), for the
 full memory and CPU budget. The save (`ct_sram.srm`), `ct_settings.ini` and the log appear in the same folder.
 **L3 + R3** (press both sticks) opens the mods menu, including the Switch's clock profile; the defaults give the
-vanilla game at 256x224. **ZL + ZR** opens the save/load state menu ([docs/SAVESTATES.md](docs/SAVESTATES.md)). For the controls, the clock profiles, the performance HUD and the report files see
+vanilla game at 256x224. The Video tab also picks the video backend (SDL_Renderer, OpenGL, Vulkan, deko3d; applied at the next start). **ZL + ZR** opens the save/load state menu ([docs/SAVESTATES.md](docs/SAVESTATES.md)). For the controls, the clock profiles, the performance HUD and the report files see
 [docs/SWITCH.md](docs/SWITCH.md).

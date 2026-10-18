@@ -2,8 +2,16 @@
 // through SDL_GL_GetProcAddress (no GL headers, no loader library, nothing linked).
 #include "present.h"
 #include "present_vk.h"
+#ifdef CT_HAVE_DEKO3D
+#include "present_dk.h"
+#endif
+#ifdef __SWITCH__
+#include <glad/glad.h>     // the overlay's GL loader (ImGui's own would dlopen); loaded here once the context exists
+#endif
 #include "hoststats.h"
 #include "hostpool.h"
+#include "switch_platform.h"
+#include "overlay.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,9 +92,13 @@ struct CtPresenter {
   int sdlLinear;             // the texture's current scale mode
   // Vulkan
   CtVk* vk;
+#ifdef CT_HAVE_DEKO3D
+  CtDk* dk;                  // deko3d (the Switch)
+#endif
   // OpenGL
   SDL_GLContext ctx;
   GLuint_ glTex, glFbo;
+  GLuint_ hudTex, hudFbo; int hudW, hudH; char hudKey[1024];   // the HUD as a small texture blitted at the corner (no ImGui frame, no shader)
   int glLinear;
   // THE RENDER THREAD (SDL_Renderer): see present.h
   int async;                                   // 1: Upload converts into a staging buffer, Swap hands it to the thread
@@ -123,6 +135,9 @@ static int glStart(CtPresenter* p, const CtPresentConfig* c) {
   if (!p->ctx) { fprintf(stderr, "[video] OpenGL: no context (%s)\n", SDL_GetError()); return 0; }
   SDL_GL_MakeCurrent(p->win, p->ctx);
   if (!glLoad()) return 0;
+#ifdef __SWITCH__
+  if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) { fprintf(stderr, "[video] OpenGL: glad could not load the functions\n"); return 0; }
+#endif
   SDL_GL_SetSwapInterval(c->vsync ? 1 : 0);
   gl.GenTextures(1, &p->glTex);
   gl.BindTexture(CTGL_TEXTURE_2D, p->glTex);
@@ -145,6 +160,8 @@ static int glStart(CtPresenter* p, const CtPresentConfig* c) {
 }
 static void glStop(CtPresenter* p) {
   if (p->ctx) {
+    if (p->hudFbo) gl.DeleteFramebuffers(1, &p->hudFbo);
+    if (p->hudTex) gl.DeleteTextures(1, &p->hudTex);
     if (p->glFbo) gl.DeleteFramebuffers(1, &p->glFbo);
     if (p->glTex) gl.DeleteTextures(1, &p->glTex);
     SDL_GL_DeleteContext(p->ctx);
@@ -174,15 +191,35 @@ CtPresenter* CtPresentCreate(const CtPresentConfig* c) {
     glStop(p);
     if (p->win) SDL_DestroyWindow(p->win);
     p->win = NULL;
+  } else if (c->backend == CT_BACKEND_DEKO3D && !c->software) {
+#ifdef CT_HAVE_DEKO3D
+    p->win = NULL;                                       // (NO SDL window: SDL would put an EGL surface on the screen; deko3d takes the console's native window itself)
+    if (CtDkStart(NULL, c->vsync, p->picW, p->picH, &p->dk)) {
+      snprintf(p->name, sizeof p->name, "%s", CtDkName(p->dk));
+      p->backend = CT_BACKEND_DEKO3D;
+      return p;
+    }
+    fprintf(stderr, "[video] deko3d unavailable -- SDL_Renderer instead\n");
+    CtSwitchBackendFailed();                             // (the Switch, on the dummy video driver: relaunches on the console's own; a no-op elsewhere)
+    if (p->win) SDL_DestroyWindow(p->win);
+    p->win = NULL;
+#else
+    fprintf(stderr, "[video] built without deko3d (the Switch build only) -- SDL_Renderer instead\n");
+#endif
   } else if (c->backend == CT_BACKEND_VULKAN && !c->software) {
 #ifdef CT_HAVE_VULKAN
+    #ifdef __SWITCH__
+    p->win = NULL;                                       // (no SDL window on the console: SDL would put an EGL surface on the screen; the Vulkan surface is made on the NWindow)
+#else
     p->win = makeWindow(c, SDL_WINDOW_VULKAN);
-    if (p->win && CtVkStart(p->win, c->vsync, p->picW, p->picH, &p->vk)) {
+#endif
+    if ((p->win || CtSwitchNoWindowMode()) && CtVkStart(p->win, c->vsync, p->picW, p->picH, &p->vk)) {
       snprintf(p->name, sizeof p->name, "%s", CtVkName(p->vk));
       p->backend = CT_BACKEND_VULKAN;
       return p;
     }
     fprintf(stderr, "[video] Vulkan unavailable -- SDL_Renderer instead\n");
+    CtSwitchBackendFailed();
     if (p->win) SDL_DestroyWindow(p->win);
     p->win = NULL;
 #else
@@ -201,6 +238,9 @@ void CtPresentDestroy(CtPresenter* p) {
 #ifdef CT_HAVE_VULKAN
   if (p->vk) CtVkStop(p->vk);
 #endif
+#ifdef CT_HAVE_DEKO3D
+  if (p->dk) CtDkStop(p->dk);
+#endif
   glStop(p);
   if (p->tex) SDL_DestroyTexture(p->tex);
   if (p->tex2) SDL_DestroyTexture(p->tex2);
@@ -213,6 +253,11 @@ SDL_Window*   CtPresentWindow(CtPresenter* p) { return p ? p->win : NULL; }
 const char*   CtPresentName(const CtPresenter* p) { return p ? p->name : ""; }
 SDL_Renderer* CtPresentSdlRenderer(CtPresenter* p) { return p && p->backend == CT_BACKEND_SDL ? p->ren : NULL; }
 void*         CtPresentGlContext(CtPresenter* p) { return p && p->backend == CT_BACKEND_OPENGL ? p->ctx : NULL; }
+#ifdef CT_HAVE_DEKO3D
+struct CtDk*  CtPresentDk(CtPresenter* p) { return p && p->backend == CT_BACKEND_DEKO3D ? p->dk : NULL; }
+#else
+struct CtDk*  CtPresentDk(CtPresenter* p) { (void)p; return NULL; }
+#endif
 struct CtVk*  CtPresentVk(CtPresenter* p) { return p && p->backend == CT_BACKEND_VULKAN ? p->vk : NULL; }
 
 
@@ -352,11 +397,16 @@ static void presentStop(CtPresenter* p) {
   p->async = 0;
 }
 
+void CtPresentStopThread(CtPresenter* p) { if (p) presentStop(p); }
+
 void CtPresentUpload(CtPresenter* p, const uint8_t* rgb) {
   if (!p) return;
   double st0 = statsNow();
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { CtDkUpload(p->dk, rgb); CtStatsPresent(CT_ST_UPLOAD, statsNow() - st0); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
-  if (p->backend == CT_BACKEND_VULKAN) { CtVkUpload(p->vk, rgb); return; }
+  if (p->backend == CT_BACKEND_VULKAN) { CtVkUpload(p->vk, rgb); CtStatsPresent(CT_ST_UPLOAD, statsNow() - st0); return; }
 #endif
   if (p->backend == CT_BACKEND_OPENGL) {
     gl.BindTexture(CTGL_TEXTURE_2D, p->glTex);
@@ -419,6 +469,9 @@ int CtPresentUploadScaled(CtPresenter* p, const uint8_t* rgb, int w, int k) {
 
 void CtPresentSetPicSize(CtPresenter* p, int w, int h) {
   if (!p || w <= 0 || h <= 0 || (w == p->picW && h == p->picH)) return;
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { if (CtDkSetPicSize(p->dk, w, h)) { p->picW = w; p->picH = h; } return; }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (p->backend == CT_BACKEND_VULKAN) { if (CtVkSetPicSize(p->vk, w, h)) { p->picW = w; p->picH = h; } return; }
 #endif
@@ -448,6 +501,9 @@ void CtPresentPicSize(CtPresenter* p, int* w, int* h) { *w = p ? p->picW : 0; *h
 void CtPresentOutputSize(CtPresenter* p, int* w, int* h) {
   *w = p ? p->picW : 0; *h = p ? p->picH : 0;
   if (!p) return;
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { CtDkOutputSize(p->dk, w, h); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (p->backend == CT_BACKEND_VULKAN) { CtVkOutputSize(p->vk, w, h); return; }
 #endif
@@ -458,8 +514,11 @@ void CtPresentOutputSize(CtPresenter* p, int* w, int* h) {
 void CtPresentDraw(CtPresenter* p, const SDL_Rect* dst, int linear) {
   if (!p) return;
   double st0 = statsNow();
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { CtDkDraw(p->dk, dst, linear); CtStatsPresent(CT_ST_DRAW, statsNow() - st0); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
-  if (p->backend == CT_BACKEND_VULKAN) { CtVkDraw(p->vk, dst, linear); return; }
+  if (p->backend == CT_BACKEND_VULKAN) { CtVkDraw(p->vk, dst, linear); CtStatsPresent(CT_ST_DRAW, statsNow() - st0); return; }
 #endif
   if (p->backend == CT_BACKEND_OPENGL) {
     int ow, oh; SDL_GL_GetDrawableSize(p->win, &ow, &oh);
@@ -483,12 +542,70 @@ void CtPresentDraw(CtPresenter* p, const SDL_Rect* dst, int linear) {
   CtStatsPresent(CT_ST_DRAW, statsNow() - st0);
 }
 
+// THE HUD ON THE OPENGL BACKEND: rasterised on the CPU (the same 5x7 font as SDL_Renderer's), kept as a small texture and BLITTED to the corner of the back buffer
+// before the swap -- no ImGui frame, no shader. (An ImGui frame every game frame, which the other backends use, left the menus without input on the console.)
+static void glHudDraw(CtPresenter* p, const char* const* ln, int n) {
+  if (!ln || n <= 0) return;
+  int ow = 0, oh = 0; SDL_GL_GetDrawableSize(p->win, &ow, &oh);
+  int sc = oh >= 1000 ? 3 : oh >= 540 ? 2 : 1, cw = 6 * sc, lh = 9 * sc, maxc = 0;
+  for (int i = 0; i < n; i++) { int l = (int)strlen(ln[i]); if (l > maxc) maxc = l; }
+  int w = maxc * cw + 6 * sc, h = n * lh + 4 * sc;
+  if (w < 1 || h < 1 || w > 4096 || h > 1024) return;
+  char key[1024]; int kl = snprintf(key, sizeof key, "%d|%d|", sc, n);
+  for (int i = 0; i < n && kl < (int)sizeof key - 100; i++) kl += snprintf(key + kl, sizeof key - (size_t)kl, "%s\n", ln[i]);
+  if (!p->hudTex || strcmp(key, p->hudKey)) {                          // new text: draw it again
+    uint8_t* px = (uint8_t*)malloc((size_t)w * (size_t)h * 3);
+    if (!px) return;
+    for (size_t i = 0; i < (size_t)w * (size_t)h; i++) { px[3 * i] = 12; px[3 * i + 1] = 12; px[3 * i + 2] = 12; }
+    for (int i = 0; i < n; i++)
+      for (int k = 0; ln[i][k]; k++) {
+        const uint8_t* g = NULL;
+        for (size_t f = 0; f < sizeof kFont / sizeof kFont[0]; f++) if (kFont[f].c == ln[i][k]) { g = kFont[f].r; break; }
+        if (!g) continue;
+        for (int y = 0; y < 7; y++) for (int x = 0; x < 5; x++) if (g[y] & (0x10 >> x))
+          for (int dy = 0; dy < sc; dy++) for (int dx = 0; dx < sc; dx++) {
+            int X = 3 * sc + k * cw + x * sc + dx, Y = 2 * sc + i * lh + y * sc + dy;
+            if (X < w && Y < h) { uint8_t* q = px + ((size_t)Y * (size_t)w + (size_t)X) * 3; q[0] = q[1] = q[2] = 255; }
+          }
+      }
+    if (!p->hudTex) {
+      gl.GenTextures(1, &p->hudTex); gl.BindTexture(CTGL_TEXTURE_2D, p->hudTex);
+      gl.TexParameteri(CTGL_TEXTURE_2D, CTGL_TEXTURE_MIN_FILTER, CTGL_NEAREST); gl.TexParameteri(CTGL_TEXTURE_2D, CTGL_TEXTURE_MAG_FILTER, CTGL_NEAREST);
+      gl.TexParameteri(CTGL_TEXTURE_2D, CTGL_TEXTURE_WRAP_S, CTGL_CLAMP_TO_EDGE); gl.TexParameteri(CTGL_TEXTURE_2D, CTGL_TEXTURE_WRAP_T, CTGL_CLAMP_TO_EDGE);
+      gl.GenFramebuffers(1, &p->hudFbo);
+    }
+    gl.PixelStorei(CTGL_UNPACK_ALIGNMENT, 1);
+    gl.BindTexture(CTGL_TEXTURE_2D, p->hudTex);
+    gl.TexImage2D(CTGL_TEXTURE_2D, 0, CTGL_RGB8, w, h, 0, CTGL_RGB, CTGL_UNSIGNED_BYTE, px);
+    gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, p->hudFbo);
+    gl.FramebufferTexture2D(CTGL_READ_FRAMEBUFFER, CTGL_COLOR_ATTACHMENT0, CTGL_TEXTURE_2D, p->hudTex, 0);
+    free(px); p->hudW = w; p->hudH = h; snprintf(p->hudKey, sizeof p->hudKey, "%s", key);
+  }
+  gl.Disable(CTGL_SCISSOR_TEST);
+  gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, p->hudFbo);
+  gl.BindFramebuffer(CTGL_DRAW_FRAMEBUFFER, 0);
+  gl.BlitFramebuffer(0, 0, p->hudW, p->hudH, 4, oh - 4, 4 + p->hudW, oh - 4 - p->hudH, CTGL_COLOR_BUFFER_BIT, CTGL_NEAREST);   // (the reversed rows put the top row on top)
+  gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, 0);
+}
+
+void CtPresentDrawHud(CtPresenter* p) {                  // (the OpenGL backend's HUD; the swap calls it)
+  if (!p || p->backend != CT_BACKEND_OPENGL || p->logical) return;
+  int n = 0; const char* const* ln = CtStatsHud(&n);
+  if (getenv("CT_HUDFAKE")) { static const char* fk[] = { "ENGINE 60.0 F/S SHOWN 60.0 F/S", "FRAME AVG 16.67 MAX 16.7 MS" }; ln = fk; n = 2; }   // (a probe)
+  glHudDraw(p, ln, n);
+}
+
 void CtPresentSwap(CtPresenter* p) {
   if (!p) return;
+  if (p->backend != CT_BACKEND_SDL && p->backend != CT_BACKEND_OPENGL && !p->logical) { int n = 0; const char* const* ln = CtStatsHud(&n); CtOverlayHud(ln, n); }   // the other backends' HUD, drawn by the overlay (SDL_Renderer draws its own, below)
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { double t0 = statsNow(); CtDkSwap(p->dk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
-  if (p->backend == CT_BACKEND_VULKAN) { CtVkSwap(p->vk); return; }
+  if (p->backend == CT_BACKEND_VULKAN) { double t0 = statsNow(); CtVkSwap(p->vk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); return; }
 #endif
   double st0 = statsNow();
+  if (p->backend != CT_BACKEND_SDL && !p->logical) { int n = 0; const char* const* ln = CtStatsHud(&n); CtOverlayHud(ln, n); }   // (SDL_Renderer draws its own, below)
   if (p->async) {
     int b = p->wbuf; PJob* J = &p->jobs[b];
     J->w = p->stgW[b]; J->h = p->stgH[b]; J->hasDst = p->phasDst; J->dst = p->pdst; J->linear = p->plinear;
@@ -509,7 +626,7 @@ void CtPresentSwap(CtPresenter* p) {
     CtStatsPresent(CT_ST_SWAP, statsNow() - st0);
     return;
   }
-  if (p->backend == CT_BACKEND_OPENGL) SDL_GL_SwapWindow(p->win);
+  if (p->backend == CT_BACKEND_OPENGL) { CtPresentDrawHud(p); SDL_GL_SwapWindow(p->win); }
   else { if (!p->logical) drawHud(p->ren); SDL_RenderPresent(p->ren); }
   CtStatsPresent(CT_ST_SWAP, statsNow() - st0);
 }
@@ -517,6 +634,9 @@ void CtPresentSwap(CtPresenter* p) {
 void CtPresentSetVsync(CtPresenter* p, int on) {
   if (!p) return;
   CtPresentSync(p);
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { CtDkSetVsync(p->dk, on); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (p->backend == CT_BACKEND_VULKAN) { CtVkSetVsync(p->vk, on); return; }
 #endif
@@ -527,6 +647,9 @@ void CtPresentSetVsync(CtPresenter* p, int on) {
 int CtPresentSaveBMP(CtPresenter* p, const char* path) {
   if (!p) return 0;
   CtPresentSync(p);
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) return 0;          // (no read-back yet: the other backends take the screenshots)
+#endif
 #ifdef CT_HAVE_VULKAN
   if (p->backend == CT_BACKEND_VULKAN) return CtVkSaveBMP(p->vk, path);
 #endif

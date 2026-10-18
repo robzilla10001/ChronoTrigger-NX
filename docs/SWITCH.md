@@ -12,7 +12,8 @@ The step-by-step version, with Docker, is the README's [Quick start](../README.m
 2. `sh tools/get_imgui.sh` (Dear ImGui 1.91.5 into `third_party/imgui`; without it the mods menu is compiled out).
 3. With devkitPro (`DEVKITPRO` set; packages libnx, switch-sdl2, switch-mesa, switch-cmake; the `devkitpro/devkita64` Docker image has them all):
    `cmake -S switch -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake && cmake --build build-switch -j`
-   -> `build-switch/ct_field.nro`.
+   -> `build-switch/ct_field.nro` (SDL_Renderer, OpenGL and deko3d; Vulkan too when `third_party/mesa-switch` exists, see *Building with Vulkan*).
+4. Optional: `sh switch/build_both.sh` builds `ct_field.nro` and the second configuration `ct_field_mesa.nro` (*Two builds, side by side*) in the Docker container.
 
 ## Install
 
@@ -20,12 +21,12 @@ Put these in a folder of the SD card, e.g. `sdmc:/switch/ChronoTrigger-NX/` (the
 
 | file | from |
 |---|---|
-| `ct_field.nro` | the build |
+| `ct_field.nro` (or `ct_field_mesa.nro`) | the build |
 | `ct_assets.dat` | setup |
 | `Chrono_Trigger_USA_SNES.sfc` | setup (your dump, verified; battles and the sound driver read it) |
 
 `ct_sram.srm` (the battery save), `ct_settings.ini`, `ct_log.txt` (stdout/stderr) and `ct_stats.txt` (the per-second performance line) appear in the same folder.
-Launch from the homebrew menu in **application mode** (hold R on a game) for the full memory and CPU budget.
+Launch from the homebrew menu in **application mode** (hold R on a game) for the full memory and CPU budget; from Sphaira or as a forwarder works too.
 
 ## Controls
 
@@ -62,8 +63,73 @@ previous state as a `.bak` and to confirm before a save or load. States work eve
 The mods menu (widescreen, internal resolution, frames between, sync mode, controls, ...) is built into the Switch build with
 Dear ImGui 1.91.5. Press **L3 + R3** (both sticks) to open it, and again to close it; the left stick / d-pad moves, A selects, B backs out.
 The game is paused while it is open, and changes are saved to `ct_settings.ini` on close. Build note: `third_party/imgui` must exist
-(`sh tools/get_imgui.sh`);
-the Switch target is SDL_Renderer only (`CT_NO_GL`).
+(`sh tools/get_imgui.sh`). The menu draws through whichever video backend is running (below); it is laid out for a 1080-line surface in every mode.
+
+## Video backends (the mods menu's "Video backend")
+
+Chosen in the Video tab and applied the next time the game starts (it is saved in `ct_settings.ini`, `[video] backend=`):
+
+| Backend | `backend=` | Notes |
+|---|---|---|
+| SDL_Renderer | `sdl` | The default. Its own performance HUD and the render thread (below). |
+| OpenGL 3.3 | `opengl` | Through Mesa; the frame is a texture blitted to the back buffer. The performance HUD is drawn by `present.c` (CPU-rasterised, blitted to the corner). |
+| Vulkan | `vulkan` | Mesa's NVK driver from [mesa-switch](https://github.com/danfromtico/mesa-switch) (Mesa 26.2.4, MIT), linked into the game with no loader (`src/present_vk.c`: a surface on the console's NWindow through `VK_NN_vi_surface`). Needs the build step below. |
+| deko3d | `deko3d` | The Switch's native graphics API (`src/present_dk.cpp`): the frame is an RGBA texture drawn as one quad; the menus and the HUD draw through a small deko3d renderer of Dear ImGui's draw data. |
+
+Vulkan and deko3d have no screenshots yet. A backend that cannot start falls back to SDL_Renderer with the reason in `ct_log.txt`. A backend that crashes its own start is
+caught too: a marker file (`ct_backend_try`) is written before a non-default backend starts and removed after two seconds of frames, and a start that finds it still there goes
+back to SDL_Renderer (and says so in the log). The deko3d shaders are pre-built (`src/dk/dk_shaders.inc`, from the `.glsl` files beside it with `src/dk/build_shaders.sh`).
+
+**Vulkan and deko3d get no SDL window.** The console's SDL video driver connects the screen's only window (the NWindow) to an EGL surface the moment a window is created, which
+leaves nothing for deko3d's swapchain or Vulkan's surface (deko3d fails fatally). So with one of those backends the game starts SDL's video subsystem but creates no window, the
+backend takes the screen itself, and `switch_platform.c` adds the touch screen as SDL finger events and runs the applet loop. (SDL's "dummy" video driver, which would have
+avoided this, is not built into the console's SDL.) The surface is 1920x1080 in every mode, like SDL's own EGL window (the compositor scales it to the handheld panel), and the
+mods menu's font is sized from the surface's height, so the menus look the same on every backend.
+
+### Building with Vulkan
+
+```sh
+sh switch/get_mesa.sh        # clones and builds mesa-switch in Docker (first run: an image with SPIRV-Tools and a Rust nightly, ~10 GB, a while)
+```
+
+This leaves `third_party/mesa-switch/` (the Khronos headers and `nvk_vulkan.o`), and the next `cmake` of `switch/` compiles the Vulkan backend in and
+links it; without that folder the build has no working Vulkan and the menu entry falls back to SDL_Renderer. Two things the script does that
+mesa-switch's own Docker build does not: it cross-compiles the Rust parts for aarch64 (that build silently produced x86-64 objects), and it combines NVK, its
+Rust shader compiler and the Rust runtime into one object in which only the `vk*` API is global, because the console's older Mesa (the libEGL that SDL's
+renderer and the OpenGL backend use) defines the same internal symbols. The NRO grows by about 15 MB.
+
+### Two builds, side by side
+
+`sh switch/build_both.sh` builds the game twice, so the known-good configuration is never replaced by the experimental one:
+
+| NRO | Graphics stack | Use |
+|---|---|---|
+| `ct_field.nro` | The console's own (older) Mesa for SDL_Renderer and OpenGL; NVK Vulkan beside it as one isolated object. | The known-good build. |
+| `ct_field_mesa.nro` | **Everything on mesa-switch's Mesa 26.2**: its EGL / OpenGL / GLES (what SDL_Renderer and the OpenGL backend draw through) and its NVK Vulkan, one stack and one GPU runtime, no libdrm_nouveau. Shows in the Homebrew Menu as "Chrono Trigger (C) - Mesa". | The newest drivers. Run on hardware with all four backends; `ct_field.nro` stays the reference. |
+
+Both read the same `ct_settings.ini` and saves, so you can switch between them freely. The second one is `-DCT_MESA_UNIFIED=ON` in `switch/CMakeLists.txt`,
+its libraries come from `sh switch/get_mesa_unified.sh` (`third_party/mesa-switch-unified`). With it OpenGL can also run Mesa's Zink (OpenGL on top of NVK):
+set `MESA_SWITCH_GL_DRIVER=zink` before the game starts (the default is Mesa's native NVC0 driver).
+
+## How the game exits (`ct_boost.ini`, `exit=`)
+
+The default (`exit=0`) is right for both NROs. The setting exists for diagnosis; every step is written to `ct_log.txt` (`exit mode N ...`, `exit: overlay down`, ...).
+
+| `exit=` | What happens |
+|---|---|
+| 0 (default) | every thread joined, every teardown (overlay, presenter / EGL / GPU, SDL), the GPU services released, then return from `main` |
+| 1 | the same without the graphics teardown |
+| 2 | no teardown, the process is ended at once (`svcExitProcess`; application mode only) |
+| 3 | every teardown, then the process is ended |
+
+What the exit has to get right, found with crash reports from the homebrew loader (hbmenu, Sphaira; a forwarder, the game as its own title, never had the trouble because the
+process simply ends):
+
+* **Every thread of ours must be gone.** The loader panics (`2001-0106`, a break inside `hbl`) when it unmaps a program that still has running threads: the three clock probes, the two
+  pool workers, the sound thread and the render thread are all stopped and joined first.
+* **The GPU must be torn down, and its services released.** Skipping the graphics teardown (`exit=1`) leaves GPU mappings the loader cannot unmap on the Mesa 26 build; after a full
+  teardown the loader's next program (Sphaira) failed with `2001-0132`, out of resource, until the exit also closed any nvdrv sessions the runtime left open (`CtSwitchReleaseGpu`).
+* `svcExitProcess` (`exit=2`, `3`) skips the applet's own clean exit and ends in the system's error dialog.
 
 ## The render thread
 

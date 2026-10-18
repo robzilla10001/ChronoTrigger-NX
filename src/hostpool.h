@@ -20,6 +20,7 @@ typedef void (*CtAsyncFn)(void* ctx);
 int  CtAsyncAvailable(void);
 void CtAsyncRun(CtAsyncFn fn, void* ctx);
 void CtAsyncJoin(void);
+void CtHostThreadsStop(void);                             // end and join the pool workers and the background job's thread (at exit)
 #ifdef __cplusplus
 }
 #endif

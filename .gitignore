@@ -20,6 +20,9 @@ dump.bin
 /third_party/SDL2/
 /third_party/imgui/
 /third_party/vulkan/
+/third_party/mesa-switch/
+/third_party/mesa-switch-unified/
+/third_party/_mesa-switch-src/
 
 # Execution traces are large and regenerable (ct.exe --trace > ...)
 disasm/boot_trace*.txt
@@ -129,5 +132,4 @@ tools/_*
 /cmake/
 /src/ct_world.c
 /src/overlay_stub.c
-/src/present_vk.c
 /src/viewer.c

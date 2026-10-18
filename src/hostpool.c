@@ -8,6 +8,7 @@ static struct {
 } g_job;
 static SDL_sem *g_go, *g_done;
 static SDL_Thread* g_th[4];
+static volatile int g_quit;                                 // CtHostThreadsStop: the workers leave their loops
 static int g_nth = -1;
 
 static void work(void) {
@@ -20,7 +21,7 @@ static void work(void) {
 }
 static int worker(void* arg) {
   (void)arg;
-  for (;;) { SDL_SemWait(g_go); work(); SDL_SemPost(g_done); }
+  for (;;) { SDL_SemWait(g_go); if (g_quit) return 0; work(); SDL_SemPost(g_done); }
 }
 int CtPoolThreads(void) {
   if (g_nth >= 0) return g_nth;
@@ -56,7 +57,7 @@ static SDL_Thread* g_at; static SDL_sem *g_aGo, *g_aDone; static SDL_threadID g_
 static CtAsyncFn g_aFn; static void* g_aCtx; static int g_aPending; static int g_aInit = -1;       /* g_aPending: touched by the starting thread only */
 static int asyncWorker(void* arg) {
   (void)arg; g_aTid = SDL_ThreadID();
-  for (;;) { SDL_SemWait(g_aGo); g_aFn(g_aCtx); SDL_SemPost(g_aDone); }
+  for (;;) { SDL_SemWait(g_aGo); if (g_quit) return 0; g_aFn(g_aCtx); SDL_SemPost(g_aDone); }
 }
 int CtAsyncAvailable(void) {
   if (g_aInit >= 0) return g_aInit;
@@ -82,4 +83,15 @@ void CtAsyncRun(CtAsyncFn fn, void* ctx) {
   CtAsyncJoin();
   g_aFn = fn; g_aCtx = ctx; g_aPending = 1;
   SDL_SemPost(g_aGo);
+}
+
+// Ends every thread this file started and waits for them: a program that leaves threads running when it returns to the homebrew loader makes the loader's
+// unmapping of the program fail (the system's "an error has occurred" dialog). Safe to call twice; nothing here is used afterwards.
+void CtHostThreadsStop(void) {
+  CtAsyncJoin();
+  g_quit = 1;
+  if (g_at) { SDL_SemPost(g_aGo); SDL_WaitThread(g_at, NULL); g_at = NULL; }
+  for (int i = 0; i < g_nth && i < 4; i++) if (g_th[i]) SDL_SemPost(g_go);
+  for (int i = 0; i < g_nth && i < 4; i++) if (g_th[i]) { SDL_WaitThread(g_th[i], NULL); g_th[i] = NULL; }
+  g_nth = 0; g_aInit = 0;
 }

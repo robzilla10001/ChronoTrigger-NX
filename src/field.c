@@ -21,6 +21,9 @@
 #define SDL_MAIN_HANDLED
 #include "rom_verify.h"
 #include "switch_platform.h"
+#ifdef __SWITCH__
+#define SDL_PollEvent(e) CtSwitchPollEvent(e)   /* (the dummy video driver's applet loop and touch screen: switch_platform.h) */
+#endif
 #include "hoststats.h"
 #include "hostpool.h"
 #include "savestate_engine.h"
@@ -9717,6 +9720,7 @@ static void ssFullRestore(const char* spec) { (void)spec; }
 #endif
 // The save/load state menu (ZL + ZR), modal like the options: the game stands still while it is open. B, ZL+ZR again or "Return to game" close it.
 static int fieldStateModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
+  CtOverlayRefreshPads();
   CtPresentSetAsync(pr, 0);
   if (dev) SDL_PauseAudioDevice(dev, 1);
   CtStateMenuOpen();
@@ -9765,6 +9769,7 @@ static int fieldStateModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
 }
 // The F1 overlay, modal: draws the paused picture and the options until the player closes them; 1 = leave the game.
 static int fieldOptionsModal(CtPresenter* pr, SDL_AudioDeviceID dev) {
+  CtOverlayRefreshPads();
   CtPresentSetAsync(pr, 0);                          // the overlay draws on this thread: wait for the render thread, take the renderer back
   if (dev) SDL_PauseAudioDevice(dev, 1);
   int open = 1, quit = 0;
@@ -11227,6 +11232,16 @@ int main(int argc, char** argv) {
   // SDL_VIDEODRIVER=dummy and often no audio device at all), the ROM may be absent, and the $C7
   // upload may not complete. Any of those degrades to a silent-but-correct run -- audio must never
   // be able to fail a regression check or block the engine.
+#ifdef __SWITCH__
+  { CtSettingsLoad(1);                               // (the choice is needed now: deko3d and Vulkan cannot share the screen's window with SDL's own EGL surface)
+    CtSettings* st0 = CtSettingsGet();
+    if (st0->backend != CT_BACKEND_SDL && CtSwitchBackendTryPending()) {          // the last start with it did not get through
+      fprintf(stderr, "[video] the last start with backend %d did not get through: back to SDL_Renderer\n", st0->backend); fflush(stderr);
+      st0->backend = CT_BACKEND_SDL; CtSettingsSave(); CtSwitchBackendTryEnd();
+    }
+    if (st0->backend == CT_BACKEND_VULKAN || st0->backend == CT_BACKEND_DEKO3D) CtSwitchNoWindow();
+    if (st0->backend != CT_BACKEND_SDL) CtSwitchBackendTryBegin(); }
+#endif
   CtSwitchTrace("SDL_Init");
   if (SDL_Init(SDL_INIT_VIDEO) != 0) { printf("FAIL: SDL_Init: %s\n", SDL_GetError()); return 4; }
   // THE PLAYER'S OPTIONS (settings.h): read only by an interactive run -- a headless one (--selftest, CT_NOPACE, the
@@ -11721,6 +11736,7 @@ int main(int argc, char** argv) {
       t.caxis.axis = SDL_CONTROLLER_AXIS_TRIGGERRIGHT; SDL_PushEvent(&t); }
     int stateReq = 0;                                // ZL + ZR: the save/load state menu, this pass
     while (SDL_PollEvent(&e)) {
+      if (e.type == SDL_CONTROLLERDEVICEADDED || e.type == SDL_CONTROLLERDEVICEREMOVED) CtOverlayRefreshPads();   // (the menus' controller list: overlay.cpp)
       if (e.type == SDL_QUIT) running = 0;           // window X: quit ONLY (never resolves a battle -- see battlePhase)
       else if (e.type == SDL_CONTROLLERDEVICEADDED) fieldPadOpen();
       else if (fieldTriggerChord(&e)) { if (CtOverlayAvailable()) stateReq = 1; }
@@ -11794,6 +11810,7 @@ int main(int argc, char** argv) {
       g_ssh.fb = fb; g_ssh.fbW = CAMW; g_ssh.fbH = CAMH;
       g_ssh.loc = g_ssh.wram[0x0100] | (g_ssh.wram[0x0101] << 8);
       g_ssh.mode = battlePhase ? CT_SS_MODE_BATTLE : inWorld ? CT_SS_MODE_WORLD : menuPhase ? CT_SS_MODE_MENU : CT_SS_MODE_FIELD;
+      { static int upFrames; if (++upFrames == 120) CtSwitchBackendTryEnd(); }      // (the Switch: two seconds of frames up -- the chosen video backend got through its start)
       g_ssh.unavailable = NULL;      // every mode saves: the field, the menu, the overworld, a battle, a fade, a translated stage, the title and the load screen (docs/SAVESTATES.md)
       if ((dbg.ssRound || getenv("CT_SS_XSAVE") || getenv("CT_SS_XLOAD")) && getenv("CT_SS_FORCE")) g_ssh.unavailable = NULL;      // (the round trip probing a mode the game still refuses to save in)
       // CT_SS_ROUNDTRIP=<A>:<B>: the framework's own proof, in one process. At frame A save a state (in memory); run B frames, hashing the WRAM and
@@ -11951,6 +11968,8 @@ int main(int argc, char** argv) {
           CtPresentSetAsync(pr, 0);                       // (the probe draws on this thread)
           if (g_lastShown) hostUploadPictureAt(pr, g_lastShown, g_lastShownW, 256, 0); else hostUploadPicture(pr, fb);
           if (tab == 9) hostDrawPicture(pr);             // (:9 -- the picture alone, no overlay)
+          else if (tab == 14) { static const char* hud[] = { "ENGINE 60.0 F/S SHOWN 60.0 F/S", "FRAME AVG 16.67 MAX 16.7 MS", "AUDIO 0.4 PICTURE 1.2 UPLOAD 0.3" };   // (:14 -- the picture and the HUD the non-SDL backends draw)
+                                hostDrawPicture(pr); if (CtPresentSdlRenderer(pr) || CtPresentGlContext(pr)) CtPresentDrawHud(pr); else CtOverlayHud(hud, 3); }
           else if (tab >= 10) {                          // :10 the save/load state menu; :11 its restore list, :12 a save confirmation, :13 the restore confirmation
             CtStateMenuOpen(); if (tab > 10) CtStateMenuDebugPopup(tab - 10);
             for (int i = 0; i < 6; i++) { CtStateMenuFrame(); hostDrawPicture(pr); CtOverlayRender(); }
@@ -19754,10 +19773,27 @@ int main(int argc, char** argv) {
   fieldFree(&f);
   if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
   CtAudioFree(audio); free(audioBuf);
-  CtOverlayShutdown(); CtPresentDestroy(pr); (void)win; SDL_Quit();
+  // THE SWITCH'S EXIT (ct_boost.ini `exit=`, default 1; found by trying them on the console -- each of these ended in the system's error dialog before the default
+  // was chosen, see docs/SWITCH.md): 0 = every teardown, then return from main; 1 = no teardown of EGL / the GPU / SDL, return from main; 2 = no teardown, end the
+  // process at once; 3 = every teardown, end the process. Every step is logged and flushed, so the log says how far an exit got.
+  { int em = CtSwitchExitMode(), full = (em == 0 || em == 3), kill = (em == 2 || em == 3);
+    char b[80]; snprintf(b, sizeof b, "exit mode %d (%s teardown, then %s)", em, full ? "full" : "no", kill ? "end the process" : "return from main"); CtSwitchTrace(b);
+    CtPresentStopThread(pr); CtSwitchTrace("exit: render thread joined");           // EVERY thread of ours ends before the program returns to the homebrew loader:
+    CtHostThreadsStop(); CtSwitchTrace("exit: pool and sound threads joined");     // one left running makes the loader's unmapping fail (the system's error dialog)
+    CtSwitchThreadsStop(); CtSwitchTrace("exit: clock probes joined");
+    if (full) {
+      CtOverlayShutdown(); CtSwitchTrace("exit: overlay down");
+      CtPresentDestroy(pr); (void)win; CtSwitchTrace("exit: presenter down");
+      SDL_Quit(); CtSwitchTrace("exit: SDL down");
+    }
+    CtSwitchReleaseGpu(); CtSwitchTrace("exit: GPU services released");
+    CtSwitchLogFlush();
+    if (kill && CtSwitchFastExitOk()) CtSwitchExit();
+  }
   // The run's effect-program coverage, so a check can grade "no opcode of the battles' programs was missing"
   // (CD/1680 kills a slot on an opcode this port has not derived; the count is cumulative over the process).
   if (getenv("CT_BATTLE_TRACE")) printf("fleeprog: run total stops=%d\n", CtBattleFxProgStops());
   CtAssetsClose(&assets);
+  CtSwitchTrace("exit: returning from main");
   return 0;
 }

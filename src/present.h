@@ -5,7 +5,8 @@
 // Backends (settings.h `backend`, chosen at start):
 //   CT_BACKEND_SDL     SDL_Renderer (Direct3D / OpenGL / software, settings `render_driver`) -- also the headless one
 //   CT_BACKEND_OPENGL  an OpenGL 3.3 core context: the frame is a texture, blitted to the back buffer
-//   CT_BACKEND_VULKAN  Vulkan 1.0 (present_vk.c; built when third_party/vulkan has the Khronos headers)
+//   CT_BACKEND_VULKAN  Vulkan 1.0 (present_vk.c; built when third_party/vulkan has the Khronos headers; the PC only)
+//   CT_BACKEND_DEKO3D  the Switch's own API (present_dk.cpp, libdeko3d; the Switch build only)
 // A backend that cannot start falls back to SDL_Renderer, and SDL_Renderer to its software renderer.
 #ifndef CT_PRESENT_H
 #define CT_PRESENT_H
@@ -15,7 +16,7 @@
 extern "C" {
 #endif
 
-enum { CT_BACKEND_SDL = 0, CT_BACKEND_OPENGL = 1, CT_BACKEND_VULKAN = 2 };
+enum { CT_BACKEND_SDL = 0, CT_BACKEND_OPENGL = 1, CT_BACKEND_VULKAN = 2, CT_BACKEND_DEKO3D = 3 };
 
 typedef struct CtPresenter CtPresenter;
 
@@ -51,7 +52,9 @@ void          CtPresentSwap(CtPresenter* p);
 // and Swap hands the frame over (and waits only if the previous one is not done yet). Anything else that touches the renderer from the
 // main thread (the overlay, a resize, a screenshot) must stand on a sync point: SetAsync(0) / Sync.
 void          CtPresentSetAsync(CtPresenter* p, int on);              // on: start the thread if the renderer allows; off: wait for it, then back to direct calls
+void          CtPresentDrawHud(CtPresenter* p);                       // the OpenGL backend's HUD (drawn by the swap; a probe draws it before a screenshot)
 void          CtPresentSync(CtPresenter* p);                          // wait until the render thread has finished the last frame
+void          CtPresentStopThread(CtPresenter* p);                    // end and join the render thread (at exit; the presenter itself stays)
 
 void          CtPresentSetVsync(CtPresenter* p, int on);
 void          CtPresentPicSize(CtPresenter* p, int* w, int* h);       // the uploaded picture's size: what is RENDERED
@@ -59,6 +62,7 @@ void          CtPresentOutputSize(CtPresenter* p, int* w, int* h);    // the dra
 int           CtPresentSaveBMP(CtPresenter* p, const char* path);     // what was drawn since the last swap; 1 = saved
 SDL_Renderer* CtPresentSdlRenderer(CtPresenter* p);       // CT_BACKEND_SDL: the renderer (the overlay's), else NULL
 void*         CtPresentGlContext(CtPresenter* p);         // CT_BACKEND_OPENGL: the context, else NULL
+struct CtDk*  CtPresentDk(CtPresenter* p);                // CT_BACKEND_DEKO3D: the backend (present_dk.h), else NULL
 struct CtVk*  CtPresentVk(CtPresenter* p);                // CT_BACKEND_VULKAN: the backend (present_vk.h), else NULL
 #ifdef __cplusplus
 }

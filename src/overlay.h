@@ -25,6 +25,8 @@ int  CtOverlayAvailable(void);
 int  CtOverlayProcessEvent(const SDL_Event* e);
 // Build this frame's options window; returns CT_OVL_* flags.
 int  CtOverlayFrame(void);
+void CtOverlayHud(const char* const* lines, int n);       // the performance HUD (hoststats) over the frame being recorded, for the backends that have no HUD of their own; no-op when n <= 0
+void CtOverlayRefreshPads(void);                          // tell ImGui's backend to re-read the connected controllers (a menu opening, a device event)
 void CtOverlayRender(void);                               // draw it (after the host drew the game picture)
 void CtOverlaySetPadName(const char* name);               // the connected controller, or NULL
 void CtOverlaySelectTab(int tab);                         // (CT_OVERLAY_SHOT) open on tab 0..3 next frame

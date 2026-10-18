@@ -1,6 +1,9 @@
 // overlay.cpp - the F1 options overlay: Dear ImGui (third_party/imgui, tools/get_imgui.ps1) over the paused game,
 // on the SDL_Renderer the game presents with. See overlay.h. Edits settings.h's options; the host applies them.
 #include <time.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 extern "C" {
 #include "savestate.h"
 }
@@ -16,6 +19,9 @@ extern "C" {
 #include "backends/imgui_impl_vulkan.h"
 #include "present_vk.h"
 #endif
+#ifdef CT_HAVE_DEKO3D
+#include "present_dk.h"
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -23,10 +29,17 @@ static SDL_Renderer* g_ren;
 static int g_ok;
 static int g_gl;                                           // the OpenGL backend (else SDL_Renderer)
 static CtVk* g_vk;                                         // the Vulkan backend
+#ifdef CT_HAVE_DEKO3D
+static CtDk* g_dk;                                         // the deko3d backend (the Switch)
+#endif
 #ifdef CT_HAVE_VULKAN
 static PFN_vkVoidFunction vkLoader(const char* name, void* user) { return (PFN_vkVoidFunction)CtVkProc((CtVk*)user, name); }
 #endif
 static char g_backendName[160];
+static int g_logPads;                                       // log once, at the next menu frame, what ImGui knows of the pads
+static CtPresenter* g_pr;                                   // (the presenter: the display size when there is no SDL window)
+static SDL_Window* g_hudWin;                                // the window the overlay was started on
+static int g_menuDrew;                                      // a menu frame was built since the last HUD: the HUD sits that one out (two ImGui frames per host frame would split a tap)
 static char g_padName[128];
 // a binding being captured: the button, and which slot (0 / 1 = keyboard keys, 2 = the controller)
 static int g_capBtn = -1, g_capSlot = 0;
@@ -35,13 +48,27 @@ extern "C" void CtOverlaySelectTab(int tab) { g_selTab = tab; }
 
 extern "C" int CtOverlayAvailable(void) { return g_ok; }
 
+// With no SDL window (deko3d, Vulkan on the console) the SDL backend's NewFrame reads a zero size: the screen's size is the presenter's.
+static void fixDisplay(void) {
+  ImGuiIO& io = ImGui::GetIO();
+  if (g_hudWin || !g_pr) return;
+  int w = 0, h = 0; CtPresentOutputSize(g_pr, &w, &h);
+  if (w <= 0 || h <= 0) { w = 1280; h = 720; }
+  io.DisplaySize = ImVec2((float)w, (float)h); io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+}
 extern "C" int CtOverlayInit(CtPresenter* pr) {
   if (g_ok) return 1;
   SDL_Window* win = CtPresentWindow(pr);
+  g_hudWin = win; g_pr = pr;
   SDL_Renderer* ren = CtPresentSdlRenderer(pr);
   void* glc = CtPresentGlContext(pr);
   CtVk* vk = CtPresentVk(pr);
-  if (!win || (!ren && !glc && !vk)) return 0;
+#ifdef CT_HAVE_DEKO3D
+  CtDk* dk = CtPresentDk(pr);
+  if ((!win && !dk && !vk) || (!ren && !glc && !vk && !dk)) return 0;
+#else
+  if ((!win && !vk) || (!ren && !glc && !vk)) return 0;
+#endif
   snprintf(g_backendName, sizeof g_backendName, "%s", CtPresentName(pr));
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -51,16 +78,30 @@ extern "C" int CtOverlayInit(CtPresenter* pr) {
   // The built-in bitmap font at a whole multiple of its 13 px, from the window's height: sharp at 2x on a 1080p
   // fullscreen, 1x in the default 512x448 window.
   { int ow = 0, oh = 0; CtPresentOutputSize(pr, &ow, &oh);
-    int k = (oh + 270) / 540; if (k < 1) k = 1; if (k > 4) k = 4;
+    float kf;
 #ifdef __SWITCH__
-    if (k < 2) k = 2;                                      // a 720p handheld screen read from arm's length: 13 px is too small
+    // Twice the 13 px font at 1080 lines -- SDL's EGL window on the console is 1080 lines in every mode (the compositor scales it to the handheld panel) -- and
+    // proportionally less on a surface of another height.
+    kf = 2.0f * (float)(oh > 0 ? oh : 1080) / 1080.0f;
+    if (kf < 1.0f) kf = 1.0f;
+#else
+    int k = (oh + 270) / 540; if (k < 1) k = 1; if (k > 4) k = 4;       // (a whole multiple of the font's 13 px, from the window's height)
+    kf = (float)k;
 #endif
-    ImFontConfig fc; fc.SizePixels = 13.0f * (float)k; io.Fonts->AddFontDefault(&fc);
-    ImGui::GetStyle().ScaleAllSizes((float)k); }
+    ImFontConfig fc; fc.SizePixels = 13.0f * kf; io.Fonts->AddFontDefault(&fc);
+    ImGui::GetStyle().ScaleAllSizes(kf); }
   ImGui::StyleColorsDark();
   ImGuiStyle& st = ImGui::GetStyle();
   st.WindowRounding = 6.0f; st.FrameRounding = 4.0f; st.GrabRounding = 4.0f;
   bool ok;
+#ifdef CT_HAVE_DEKO3D
+  if (dk) {
+    ok = ImGui_ImplSDL2_InitForOther(win) && CtDkImGuiInit(dk);
+    if (!ok) { ImGui::DestroyContext(); return 0; }
+    g_dk = dk; g_ren = NULL; g_gl = 0; g_vk = NULL; g_ok = 1;
+    return 1;
+  }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (vk) {
     CtVkInfo vi; CtVkInfoGet(vk, &vi);
@@ -86,6 +127,9 @@ extern "C" int CtOverlayInit(CtPresenter* pr) {
 
 extern "C" void CtOverlayShutdown(void) {
   if (!g_ok) return;
+#ifdef CT_HAVE_DEKO3D
+  if (g_dk) { CtDkImGuiShutdown(g_dk); ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext(); g_dk = NULL; g_ok = 0; return; }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (g_vk) ImGui_ImplVulkan_Shutdown(); else
 #endif
@@ -171,8 +215,12 @@ static void bindCell(int btn, const char* label) {
 
 extern "C" int CtOverlayFrame(void) {
   if (!g_ok) return CT_OVL_CLOSE;
+  g_menuDrew = 1;
   int ch = 0;
   CtSettings* s = CtSettingsGet();
+#ifdef CT_HAVE_DEKO3D
+  if (g_dk) {} else                                          // (deko3d: the font is the backend's only state, built at init)
+#endif
 #ifdef CT_HAVE_VULKAN
   if (g_vk) ImGui_ImplVulkan_NewFrame(); else
 #endif
@@ -181,7 +229,9 @@ extern "C" int CtOverlayFrame(void) {
 #endif
   ImGui_ImplSDLRenderer2_NewFrame();
   ImGui_ImplSDL2_NewFrame();
+  fixDisplay();
   ImGui::NewFrame();
+  if (g_logPads) { g_logPads = 0; const ImGuiIO& lio = ImGui::GetIO(); fprintf(stderr, "[options] menu frame: joysticks %d, ImGui sees a gamepad: %d; display %.0fx%.0f scale %.2f, font %.1f px, backend %s\n", SDL_NumJoysticks(), (lio.BackendFlags & ImGuiBackendFlags_HasGamepad) ? 1 : 0, lio.DisplaySize.x, lio.DisplaySize.y, lio.DisplayFramebufferScale.x, ImGui::GetFontSize(), g_backendName); fflush(stderr); }
   const ImGuiViewport* vp = ImGui::GetMainViewport();
   ImVec2 size(vp->WorkSize.x * 0.8f, vp->WorkSize.y * 0.85f);
   if (size.x < 420) size.x = vp->WorkSize.x; if (size.y < 320) size.y = vp->WorkSize.y;
@@ -254,26 +304,46 @@ extern "C" int CtOverlayFrame(void) {
                           "FPS only: just the frame rate.  OFF: nothing drawn.\n"
                           "It only reads clocks; it changes nothing in the game.");
       ImGui::Separator();
-#ifdef CT_NO_GL
-      ImGui::TextDisabled("Video backend: SDL_Renderer (the only one in this build).");
+      {                                                      // the video backend: what this platform has (applied at the next start)
+#ifdef __SWITCH__
+        static const char* bk[] = { "SDL_Renderer (default)", "OpenGL 3.3 (Mesa / EGL)", "Vulkan (Mesa NVK)", "deko3d (native)" };
+        static const int bkId[] = { CT_BACKEND_SDL, CT_BACKEND_OPENGL, CT_BACKEND_VULKAN, CT_BACKEND_DEKO3D };
+        const int nbk = 4;
 #else
-      const char* bk[] = { "SDL (Direct3D / automatic)", "OpenGL 3.3", "Vulkan" };
-      if (ImGui::Combo("Video backend", &s->backend, bk, 3)) ch |= CT_OVL_RESTART;
-      if (s->backend == CT_BACKEND_SDL) {
-        const char* drv[] = { "Automatic", "Direct3D 9", "Direct3D 11", "OpenGL (SDL's)", "Software" };
-        const char* drvKey[] = { "", "direct3d", "direct3d11", "opengl", "software" };
-        int cur = 0;
-        for (int i = 1; i < 5; i++) if (!strcmp(s->renderDriver, drvKey[i])) cur = i;
-        if (ImGui::Combo("SDL driver", &cur, drv, 5)) {
-          snprintf(s->renderDriver, sizeof s->renderDriver, "%s", drvKey[cur]);
-          ch |= CT_OVL_RESTART;
+        static const char* bk[] = { "SDL (Direct3D / automatic)", "OpenGL 3.3", "Vulkan" };
+        static const int bkId[] = { CT_BACKEND_SDL, CT_BACKEND_OPENGL, CT_BACKEND_VULKAN };
+        const int nbk = 3;
+#endif
+        int sel = 0;
+        for (int i = 0; i < nbk; i++) if (bkId[i] == s->backend) sel = i;
+        if (ImGui::Combo("Video backend", &sel, bk, nbk)) { s->backend = bkId[sel]; ch |= CT_OVL_RESTART; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip(
+#ifdef __SWITCH__
+            "SDL_Renderer: the default, and the one with the performance HUD and the render thread.\n"
+            "OpenGL 3.3: through Mesa's nouveau driver (mesa-switch).\n"
+            "Vulkan 1.x: Mesa's NVK driver (mesa-switch), linked into the game. No performance HUD, no screenshots yet.\n"
+            "deko3d: the Switch's own graphics API, straight to the GPU. No performance HUD and no screenshots yet.\n"
+#else
+            "SDL_Renderer: Direct3D / OpenGL / software through SDL.   OpenGL 3.3: a core-profile context.   Vulkan 1.0.\n"
+            "(deko3d is the Switch's own API: the Switch build has it.)\n"
+#endif
+            "A backend that cannot start falls back to SDL_Renderer. The choice takes effect the next time the game starts.");
+#ifndef __SWITCH__
+        if (s->backend == CT_BACKEND_SDL) {
+          const char* drv[] = { "Automatic", "Direct3D 9", "Direct3D 11", "OpenGL (SDL's)", "Software" };
+          const char* drvKey[] = { "", "direct3d", "direct3d11", "opengl", "software" };
+          int cur = 0;
+          for (int i = 1; i < 5; i++) if (!strcmp(s->renderDriver, drvKey[i])) cur = i;
+          if (ImGui::Combo("SDL driver", &cur, drv, 5)) {
+            snprintf(s->renderDriver, sizeof s->renderDriver, "%s", drvKey[cur]);
+            ch |= CT_OVL_RESTART;
+          }
         }
+#endif
       }
-#endif
       ImGui::TextDisabled("In use: %s", g_backendName);
-#ifndef CT_NO_GL
-      ImGui::TextDisabled("The backend and the driver take effect the next time the game starts.");
-#endif
+      ImGui::TextDisabled("The video backend takes effect the next time the game starts.");
       ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Audio", NULL, g_selTab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
@@ -389,9 +459,13 @@ static void smStartPopup(int which) { g_smPopup = which; g_smPopupOpened = 0; }
 
 extern "C" int CtStateMenuFrame(void) {
   if (!g_ok) return CT_SMENU_CLOSE;
+  g_menuDrew = 1;
   int ret = 0;
   CtSettings* s = CtSettingsGet();
   CtSs* ss = CtSsDefault();
+#ifdef CT_HAVE_DEKO3D
+  if (g_dk) {} else                                          // (deko3d: the font is the backend's only state, built at init)
+#endif
 #ifdef CT_HAVE_VULKAN
   if (g_vk) ImGui_ImplVulkan_NewFrame(); else
 #endif
@@ -400,6 +474,7 @@ extern "C" int CtStateMenuFrame(void) {
 #endif
   ImGui_ImplSDLRenderer2_NewFrame();
   ImGui_ImplSDL2_NewFrame();
+  fixDisplay();
   ImGui::NewFrame();
   if (g_smDebugPopup) {                                      // (CT_OVERLAY_SHOT: look at a popup)
     if (g_smDebugPopup == 1) { g_smN = CtSsListBackups(ss, g_smList, 32); smStartPopup(SM_RESTORE_LIST); }
@@ -534,6 +609,9 @@ extern "C" int CtStateMenuFrame(void) {
 
 extern "C" void CtOverlayRender(void) {
   if (!g_ok) return;
+#ifdef CT_HAVE_DEKO3D
+  if (g_dk) { CtDkImGuiRender(g_dk, ImGui::GetDrawData()); return; }
+#endif
 #ifdef CT_HAVE_VULKAN
   if (g_vk) { VkCommandBuffer c = (VkCommandBuffer)CtVkCommandBuffer(g_vk);
              if (c) ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), c); return; }
@@ -542,4 +620,54 @@ extern "C" void CtOverlayRender(void) {
   if (g_gl) ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData()); else
 #endif
   ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), g_ren);
+}
+
+// The performance HUD for the backends that have none of their own (SDL_Renderer draws its 5x7 bitmap one at the swap): one ImGui frame with the lines in the top-left corner.
+// Skipped while a menu is up (its own frame has just been built; a second one would take half a tap) and when there is nothing to show.
+extern "C" void CtOverlayHud(const char* const* lines, int n) {
+  if (!g_ok) return;
+  if (g_menuDrew) { g_menuDrew = 0; return; }
+  if (!lines || n <= 0) return;
+#ifdef CT_HAVE_DEKO3D
+  if (g_dk) {} else
+#endif
+#ifdef CT_HAVE_VULKAN
+  if (g_vk) ImGui_ImplVulkan_NewFrame(); else
+#endif
+#ifndef CT_NO_GL
+  if (g_gl) ImGui_ImplOpenGL3_NewFrame(); else
+#endif
+  ImGui_ImplSDLRenderer2_NewFrame();
+  // NOT ImGui_ImplSDL2_NewFrame: that one also polls the pads and the mouse, and a frame of it every game frame is what the menus' controller input did not survive.
+  // The HUD needs only a display size and a time step.
+  { ImGuiIO& hio = ImGui::GetIO(); int ww = 0, wh = 0, dw = 0, dh = 0;
+    SDL_Window* hw = SDL_GL_GetCurrentWindow(); if (!hw) hw = g_hudWin;
+    if (hw) { SDL_GetWindowSize(hw, &ww, &wh); SDL_GL_GetDrawableSize(hw, &dw, &dh); }
+    if ((ww <= 0 || wh <= 0) && g_pr) { CtPresentOutputSize(g_pr, &ww, &wh); dw = ww; dh = wh; }
+    if (ww <= 0 || wh <= 0) { ww = 1280; wh = 720; dw = ww; dh = wh; }
+    hio.DisplaySize = ImVec2((float)ww, (float)wh);
+    hio.DisplayFramebufferScale = ImVec2(dw > 0 ? (float)dw / (float)ww : 1.0f, dh > 0 ? (float)dh / (float)wh : 1.0f);
+    hio.DeltaTime = 1.0f / 60.0f; }
+  ImGui::NewFrame();
+  { static int first = 1; if (first) { first = 0; fprintf(stderr, "[hud] first frame: %d lines, display %.0fx%.0f\n", n, ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y); fflush(stderr); } }
+  { ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float oh = ImGui::GetIO().DisplaySize.y;
+    const int sc = oh >= 1000 ? 3 : oh >= 540 ? 2 : 1;
+    const float fs = 8.0f * (float)sc, lh = 9.0f * (float)sc;
+    float w = 0;
+    for (int i = 0; i < n; i++) { float tw = ImGui::GetFont()->CalcTextSizeA(fs, 1e9f, 0.0f, lines[i]).x; if (tw > w) w = tw; }
+    dl->AddRectFilled(ImVec2(4, 4), ImVec2(4 + w + 6.0f * sc, 4 + lh * (float)n + 4.0f * sc), IM_COL32(0, 0, 0, 190));
+    for (int i = 0; i < n; i++) dl->AddText(ImGui::GetFont(), fs, ImVec2(4 + 3.0f * sc, 4 + 2.0f * sc + lh * (float)i), IM_COL32(255, 255, 255, 255), lines[i]); }
+  ImGui::Render();
+  CtOverlayRender();
+}
+
+// ImGui's SDL backend builds its list of game controllers once, at its first frame, and again only when it is TOLD a device came or went (it never polls). The HUD's
+// frames start it at the first presented frame -- before the controller is attached -- and the main loop's events never reach it, so the list stayed empty and the
+// menus took no controller input for the whole run. The host now tells it at each menu opening and on every device event.
+extern "C" void CtOverlayRefreshPads(void) {
+  if (!g_ok) return;
+  g_logPads = 1;
+  SDL_Event ev; memset(&ev, 0, sizeof ev); ev.type = SDL_CONTROLLERDEVICEADDED;
+  ImGui_ImplSDL2_ProcessEvent(&ev);
 }

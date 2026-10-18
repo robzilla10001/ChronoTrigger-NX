@@ -95,7 +95,7 @@ static void setKey(CtSettings* s, const char* sec, const char* key, const char* 
     else if (!strcmp(key, "stats_hud")) s->statsHud = !strcmp(val, "full") ? CT_HUD_FULL : !strcmp(val, "fps") ? CT_HUD_FPS :
                                                        !strcmp(val, "off") ? CT_HUD_OFF : (iv != 0 ? CT_HUD_FULL : CT_HUD_OFF);   // (a number: the old on/off file = full)
     else if (!strcmp(key, "render_driver")) snprintf(s->renderDriver, sizeof s->renderDriver, "%s", val);
-    else if (!strcmp(key, "backend")) s->backend = !strcmp(val, "opengl") ? 1 : !strcmp(val, "vulkan") ? 2 : 0;
+    else if (!strcmp(key, "backend")) s->backend = !strcmp(val, "opengl") ? 1 : !strcmp(val, "vulkan") ? 2 : !strcmp(val, "deko3d") ? 3 : 0;
   } else if (!strcmp(sec, "sound")) {
     if (!strcmp(key, "volume")) s->volume = clampi(iv, 0, 100);
     else if (!strcmp(key, "mute")) s->mute = iv != 0;
@@ -146,7 +146,7 @@ int CtSettingsSave(void) {
   if (!f) return 0;
   fprintf(f, "; Chrono Trigger (native port) -- options. Edited by the F1 overlay; safe to edit by hand.\n\n");
   fprintf(f, "[video]\nbackend=%s\nfullscreen=%d\nwindow_scale=%d\nscale=%s\naspect=%s\nfilter=%s\nwidescreen=%s\nwide_room_wrap=%d\nrender_scale=%d\ninterpolation=%d\nvsync=%d\nrender_driver=%s\nstats_hud=%s\nclocks=%s\n\n",
-          s->backend == 1 ? "opengl" : s->backend == 2 ? "vulkan" : "sdl", s->fullscreen, s->windowScale,
+          s->backend == 1 ? "opengl" : s->backend == 2 ? "vulkan" : s->backend == 3 ? "deko3d" : "sdl", s->fullscreen, s->windowScale,
           s->scaleMode == CT_SCALE_INTEGER ? "integer" : s->scaleMode == CT_SCALE_STRETCH ? "stretch" : "fit",
           s->aspect == CT_ASPECT_4_3 ? "4:3" : "pixel", s->linearFilter ? "linear" : "nearest",
           s->widescreen == CT_WIDE_16_9 ? "16:9" : s->widescreen == CT_WIDE_16_10 ? "16:10" : s->widescreen == CT_WIDE_21_9 ? "21:9" : "off",
