@@ -33,7 +33,7 @@ static void screenSize(int* w, int* h) { *w = 1920; *h = 1080; }
 static uint32_t up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
 struct Frame {
-  DkMemBlock cmdMem, dynMem, stageMem; uint32_t stageBytes;
+  DkMemBlock cmdMem, dynMem, stageMem; uint32_t stageBytes; int repArmed;       // repArmed: the two GPU timestamps of this frame are on their way
   DkCmdBuf cb; DkFence fence; int fenced;
 };
 struct CtDk {
@@ -46,10 +46,24 @@ struct CtDk {
   DkMemBlock fontMem; DkImage font; int haveFont;
   Frame fr[FRAMES]; int cur;
   int recording, slot, uploaded;                          // a frame is open in fr[cur].cb on swapchain image `slot`
+  double lastGpuMs, waitedMs; long gpuSeq;                 // the GPU time of the last frame that finished, how long the CPU has blocked on fences, and a counter of new GPU times
   char name[96];
 };
 
-static void waitFrame(CtDk* d, Frame* f) { if (f->fenced) { dkFenceWait(&f->fence, UINT64_MAX); f->fenced = 0; } }
+#define REPORT_OFF 1024                                           // in a frame's dynamic block: two 16-byte timestamp reports (the uniforms use the first 256 bytes)
+static double nowMsDk(void) { return (double)armGetSystemTick() * 1000.0 / (double)armGetSystemTickFreq(); }
+static void waitFrame(CtDk* d, Frame* f) {
+  if (!f->fenced) return;
+  double t0 = nowMsDk();
+  dkFenceWait(&f->fence, UINT64_MAX); f->fenced = 0;
+  d->waitedMs += nowMsDk() - t0;
+  if (f->repArmed) {                                              // the frame is done: the GPU's own clock says how long it took
+    const uint64_t* r = (const uint64_t*)((uint8_t*)dkMemBlockGetCpuAddr(f->dynMem) + REPORT_OFF);
+    uint64_t t_start = r[1], t_end = r[3];
+    if (t_end > t_start) { d->lastGpuMs = (double)dkTimestampToNs(t_end - t_start) / 1e6; d->gpuSeq++; }
+    f->repArmed = 0;
+  }
+}
 
 static DkMemBlock makeBlock(DkDevice dev, uint32_t bytes, uint32_t flags) {
   DkMemBlockMaker mm; dkMemBlockMakerDefaults(&mm, dev, up(bytes, DK_MEMBLOCK_ALIGNMENT)); mm.flags = flags;
@@ -174,6 +188,8 @@ extern "C" void CtDkStop(CtDk* d) {
 }
 
 extern "C" const char* CtDkName(const CtDk* d) { return d->name; }
+extern "C" double CtDkGpuMs(CtDk* d, long* seq) { if (seq) *seq = d->gpuSeq; return d->lastGpuMs; }
+extern "C" double CtDkWaitedMs(CtDk* d) { return d->waitedMs; }
 extern "C" void CtDkOutputSize(CtDk* d, int* w, int* h) { *w = d->fbW; *h = d->fbH; }
 extern "C" void CtDkSetVsync(CtDk* d, int on) { d->vsync = on; if (d->sc) dkSwapchainSetSwapInterval(d->sc, on ? 1 : 0); }
 
@@ -228,6 +244,7 @@ extern "C" void CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear) {
     dkCmdBufBarrier(f->cb, DkBarrier_Full, DkInvalidateFlags_Image);
     d->uploaded = 0;
   }
+  dkCmdBufReportCounter(f->cb, DkCounter_Timestamp, dkMemBlockGetGpuAddr(f->dynMem) + REPORT_OFF);
   bindBase(d, f);
   DkViewport vp = { 0.0f, 0.0f, (float)d->fbW, (float)d->fbH, 0.0f, 1.0f };
   DkScissor sc = { 0, 0, (uint32_t)d->fbW, (uint32_t)d->fbH };
@@ -252,6 +269,8 @@ extern "C" void CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear) {
 extern "C" void CtDkSwap(CtDk* d) {
   if (!d->recording) return;
   Frame* f = &d->fr[d->cur];
+  dkCmdBufReportCounter(f->cb, DkCounter_Timestamp, dkMemBlockGetGpuAddr(f->dynMem) + REPORT_OFF + 16);
+  f->repArmed = 1;
   DkCmdList list = dkCmdBufFinishList(f->cb);
   dkQueueSubmitCommands(d->q, list);
   dkQueueSignalFence(d->q, &f->fence, true); f->fenced = 1;

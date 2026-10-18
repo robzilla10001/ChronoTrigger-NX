@@ -15,6 +15,8 @@ int         CtVkStart(SDL_Window* win, int vsync, int picW, int picH, CtVk** out
 void        CtVkStop(CtVk* v);
 const char* CtVkName(const CtVk* v);
 void        CtVkOutputSize(CtVk* v, int* w, int* h);
+double      CtVkGpuMs(CtVk* v, long* seq);             // the GPU time (ms) of the last finished frame, from timestamp queries; *seq counts new ones
+double      CtVkWaitedMs(CtVk* v);                     // ms the CPU has spent blocked on the GPU (fence, acquire) so far
 void        CtVkSetVsync(CtVk* v, int on);
 void        CtVkUpload(CtVk* v, const uint8_t* rgb24);
 void        CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear);

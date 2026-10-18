@@ -3,12 +3,14 @@
 #include "switch_platform.h"
 #include "settings.h"
 #include "present.h"
+#include "bench.h"
 #include <switch.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define CT_SWITCH_HOME "sdmc:/switch/ct"
 static char g_argv0[300];
@@ -21,6 +23,9 @@ static int logWrite(void* cookie, const char* buf, _READ_WRITE_BUFSIZE_TYPE n) {
   return (int)w;
 }
 
+// The log file is closed at exit. Every file left open is a file-system session the homebrew loader's process keeps for the next launch, and a benchmark pass or the leak test relaunches
+// through that one process: forty launches that each left one open ended in the loader's 2001-0132 (chain_probe, openlog=1). (Registered first, so it runs last.)
+static void logClose(void) { FILE* f = g_log; if (!f) return; fflush(f); g_log = NULL; fclose(f); }
 // ---- THE CLOCK PROBES (hoststats): the same fixed loop timed on the main thread's core and, by three small low-priority threads
 // pinned one per app core, on all of them. A throttled CPU clock slows every core together; a core shared with another thread
 // slows only that core.
@@ -65,10 +70,14 @@ static void readBoostIni(void) {
     if (sscanf(line, "boost=%u", &v) == 1) g_optBoost = (int)v;
     else if (sscanf(line, "pin=%u", &v) == 1) g_optPin = (int)v;
     else if (sscanf(line, "exit=%u", &v) == 1) g_exitMode = (int)v;
+    else if (sscanf(line, "leaktest=%u", &v) == 1) { char b[8]; snprintf(b, sizeof b, "%u", v); setenv("CT_LEAKTEST", b, 1); }
+    else if (sscanf(line, "leaktest_n=%u", &v) == 1) { char b[8]; snprintf(b, sizeof b, "%u", v); setenv("CT_LEAKTEST_N", b, 1); }
+    else if (sscanf(line, "bench=%u", &v) == 1) { char b[8]; snprintf(b, sizeof b, "%u", v); setenv("CT_BENCH", b, 1); }                // (bench.h)
+    else if (sscanf(line, "bench_secs=%u", &v) == 1) { char b[8]; snprintf(b, sizeof b, "%u", v); setenv("CT_BENCH_SECS", b, 1); }
     else if (sscanf(line, "async=%u", &v) == 1) setenv("CT_ASYNC_PRESENT", v ? "1" : "0", 1);   // the render thread (present.c): async=0 turns it off
   }
   fclose(f);
-  fprintf(stderr, "[switch] ct_boost.ini: boost=%d pin=%d exit=%d\n", g_optBoost, g_optPin, g_exitMode); fflush(stderr);
+  fprintf(stderr, "[switch] ct_boost.ini: boost=%d pin=%d exit=%d bench=%s bench_secs=%s\n", g_optBoost, g_optPin, g_exitMode, getenv("CT_BENCH") ? getenv("CT_BENCH") : "0 (not set)", getenv("CT_BENCH_SECS") ? getenv("CT_BENCH_SECS") : "default"); fflush(stderr);
 }
 
 // ---- THE CPU CLOCK. Homebrew starts at 1020 MHz; the engine needs 1785. Measured on hardware (hoststats): the boost-mode
@@ -178,7 +187,10 @@ void CtSwitchBoostFrame(void) {                            // once per main-loop
       if (++g_failStreak >= 3) { g_failStreak = 0; appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad); g_fallbacks++; }
     } else g_failStreak = 0; }
 }
+static int apmUp = -1;
 static void boostShutdown(void) {
+  CtSwitchLogResources("atexit: before the boost shutdown");
+  if (apmUp == 1) { apmExit(); apmUp = 0; }            // (a session left open per run adds up across the relaunches of a benchmark pass)
   if (!g_boostUp) return;
   appletUnhook(&g_hookCookie);
   if (g_gpuOpen) { if (g_gpuOrigHz) clkrstSetClockRate(&g_gpu, g_gpuOrigHz); clkrstCloseSession(&g_gpu); g_gpuOpen = 0; }
@@ -187,6 +199,7 @@ static void boostShutdown(void) {
   if (g_cpuOpen) { clkrstCloseSession(&g_cpu); g_cpuOpen = 0; clkrstExit(); }
   else if (g_pcv) { g_pcv = 0; pcvExit(); }
   g_boostUp = 0;
+  CtSwitchLogResources("atexit: after the boost shutdown"); fflush(stderr);
 }
 static void boostInit(void) {
   if (!g_optBoost) { fprintf(stderr, "[switch] boost: off (ct_boost.ini boost=0)\n"); fflush(stderr); return; }
@@ -223,7 +236,6 @@ static void boostInit(void) {
 static char g_clockInfo[160] = "";
 const char* CtSwitchClockInfo(void) { return g_clockInfo; }
 static void clockSample(void) {
-  static int apmUp = -1;
   if (apmUp < 0) apmUp = R_SUCCEEDED(apmInitialize()) ? 1 : 0;
   unsigned us = benchLoopUs();                       // 400k dependent integer ops: ~0.6 ms boosted, ~1.2 ms at 1020 MHz
   ApmPerformanceMode pm = ApmPerformanceMode_Invalid; u32 conf = 0;
@@ -255,14 +267,18 @@ void CtSwitchInit(int* argc, char*** argv) {
   if (chdir(dir) != 0) chdir("sdmc:/");
   // ONE FILE for both streams. Two FILEs on one file keep two offsets, and the SD card's driver does not append per write:
   // they overwrote each other. funopen gives stdout and stderr the same sink, a single handle that writes in order.
-  g_log = fopen("ct_log.txt", "w");
+  char logPath[256]; CtRunPath(logPath, sizeof logPath, "ct_log", "txt");        // a NEW log for every run: logs/ct_log_<program>_<start time>.txt
+  g_log = fopen(logPath, "w");
+  if (g_log) atexit(logClose);
   if (g_log) {
     FILE* sink = funopen(NULL, NULL, logWrite, NULL, NULL);
     if (sink) { stdout = sink; stderr = sink; }
   }
-  { FILE* t = fopen("ct_stats.txt", "w"); if (t) fclose(t); }   // (hoststats.c appends to it once a second)
+  { char sp[256]; CtRunPath(sp, sizeof sp, "ct_stats", "txt"); FILE* t = fopen(sp, "w"); if (t) fclose(t); }   // (hoststats.c appends to it once a second)
   setvbuf(stdout, NULL, _IOLBF, 0);
-  { char b[300]; snprintf(b, sizeof b, "init: folder %s argc %d", dir, *argc); CtSwitchTrace(b); }
+  { char b[300]; snprintf(b, sizeof b, "init: folder %s argc %d, log %s", dir, *argc, logPath); CtSwitchTrace(b); }
+  { u32 hv = hosversionGet(); char b[200]; snprintf(b, sizeof b, "run: program %s, started %s, firmware %u.%u.%u, applet type %d", CtRunName(), CtRunStamp(), HOSVER_MAJOR(hv), HOSVER_MINOR(hv), HOSVER_MICRO(hv), (int)appletGetAppletType());
+    CtSwitchTrace(b); CtBenchInfo(b); }
   // THE FILES THE ENGINE NEEDS, checked before anything starts: ct_assets.dat (the field and menu) and the ROM (battles,
   // the sound driver, scene loads: CtRomImage exits when it is absent). A missing one is a dialog that names it, not a
   // silent return to the launcher.
@@ -288,6 +304,7 @@ void CtSwitchInit(int* argc, char*** argv) {
   probesStart();
   boostInit();
   CtSwitchClockTick();
+  CtSwitchLogResources("after init + clocks");
   if (*argc <= 1) { *argc = 4; *argv = defArgv; }
 }
 
@@ -337,7 +354,49 @@ int CtSwitchPollEvent(SDL_Event* e) {
 void CtSwitchBackendTryBegin(void) { FILE* f = fopen("ct_backend_try", "w"); if (f) { fputs("1", f); fclose(f); } }
 void CtSwitchBackendTryEnd(void) { remove("ct_backend_try"); }
 int  CtSwitchBackendTryPending(void) { FILE* f = fopen("ct_backend_try", "r"); if (!f) return 0; fclose(f); return 1; }
+const char* CtSwitchSelfPath(void) { return g_argv0; }
+// WHAT THE PROCESS HOLDS, in the log. (The kernel's resource-limit handle is not available to an application: svcGetInfo says so once, in the first line.) A program that is relaunched
+// through the homebrew loader several times (a benchmark pass) shares one process, so what one run leaves mapped or open is what the next, and the launcher after the last, has less of
+// ("2001-0132", out of resource, in the loader at the end of a pass). Walking the address space with svcQueryMemory shows leaked mappings by TYPE: the heap, aliases (memory mapped
+// elsewhere), stacks and thread-local pages (one stack per live thread), shared and transfer memory, I/O mappings. Memory used / total is the kernel's own count.
+// (An application's kernel budget cannot be read -- svcGetInfo ResourceLimit returns 0xE401 -- and asking the kernel for one more session or event is refused at once, at the start of
+// every launch and after the full teardown alike (2001-0132, measured in a forwarder-launched application): the loader's process has no spare ones. See docs/BENCHMARK.md.)
+void CtSwitchLogResources(const char* tag) {
+  static int limitTried;
+  if (!limitTried) {
+    limitTried = 1; u64 h = 0; Result rc = svcGetInfo(&h, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0);
+    char b[120]; snprintf(b, sizeof b, "resource-limit handle: rc=0x%X%s", (unsigned)rc, R_SUCCEEDED(rc) ? "" : " (not available to an application)"); CtSwitchTrace(b);
+  }
+  u64 used = 0, total = 0, nonSys = 0;
+  svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0); svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+  svcGetInfo(&nonSys, InfoType_UsedNonSystemMemorySize, CUR_PROCESS_HANDLE, 0);
+  static const char* const tn[0x16] = { "unmapped", "io", "normal", "code-static", "code-mutable", "heap", "shared", "weird", "module-static", "module-mutable", "ipc0", "stack", "tls", "transfer-iso",
+                                        "transfer", "process", "reserved", "ipc1", "ipc3", "kstack", "code-ro", "code-rw" };
+  unsigned cnt[0x16] = { 0 }; unsigned long long bytes[0x16] = { 0 }; unsigned regions = 0;
+  u64 addr = 0;
+  for (int guard = 0; guard < 200000; guard++) {
+    MemoryInfo mi; u32 pi; if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) break;
+    unsigned t = mi.type & 0xFF; if (t < 0x16) { cnt[t]++; bytes[t] += mi.size; } regions++;
+    u64 next = mi.addr + mi.size; if (next <= addr || next >= (1ull << 39)) break; addr = next;
+  }
+  int fds = 0; { struct stat st; for (int fd = 3; fd < 256; fd++) if (fstat(fd, &st) == 0) fds++; }          // (open files beyond stdin/out/err: each is a file-system session of the loader's process)
+  char b[760]; int n = snprintf(b, sizeof b, "resources (%s): %d open files; memory used %llu / %llu MB (non-system %llu MB); %u regions;", tag, fds, (unsigned long long)(used >> 20), (unsigned long long)(total >> 20), (unsigned long long)(nonSys >> 20), regions);
+  for (int t = 2; t < 0x16; t++) if (cnt[t] && n < (int)sizeof b - 60) n += snprintf(b + n, sizeof b - (size_t)n, " %s %u/%lluk;", tn[t], cnt[t], bytes[t] >> 10);
+  CtSwitchTrace(b);
+  if (!strcmp(tag, "start") || !strcmp(tag, "end of run")) CtBenchInfo(b);
+}
+// Rewrites one `key=value` line of ct_boost.ini (adds it when absent): a benchmark is a one-shot, so it switches itself off when it has run.
+void CtSwitchBoostIniSet(const char* key, const char* val) {
+  char lines[64][128]; int n = 0, found = 0;
+  FILE* f = fopen("ct_boost.ini", "r");
+  if (f) { while (n < 63 && fgets(lines[n], sizeof lines[0], f)) { size_t kl = strlen(key); if (!strncmp(lines[n], key, kl) && lines[n][kl] == '=') { snprintf(lines[n], sizeof lines[0], "%s=%s\n", key, val); found = 1; } n++; } fclose(f); }
+  if (!found && n < 64) { snprintf(lines[n++], sizeof lines[0], "%s=%s\n", key, val); }
+  f = fopen("ct_boost.ini", "w"); if (!f) return;
+  for (int i = 0; i < n; i++) fputs(lines[i], f);
+  fclose(f);
+}
 void CtSwitchBackendFailed(void) {
+  if (CtBenchChainActive()) { CtBenchChainFailed("the backend could not start"); fflush(stdout); fflush(stderr); exit(0); }     // (a benchmark pass: record it and go on; the player's choice stays)
   fprintf(stderr, "[video] the chosen backend could not start: saving SDL_Renderer as the choice and relaunching\n"); fflush(stderr);
   CtSettingsGet()->backend = CT_BACKEND_SDL; CtSettingsSave();
   CtSwitchBackendTryEnd();
@@ -359,6 +418,32 @@ void CtSwitchThreadsStop(void) {
 void CtSwitchReleaseGpu(void) {
   for (int i = 0; i < 16; i++) { nvFenceExit(); nvMapExit(); nvGpuExit(); }
   for (int i = 0; i < 16; i++) nvExit();
+}
+// THE LEAK TEST (docs/BENCHMARK.md): ct_boost.ini `leaktest=<stage>` relaunches the program through the homebrew loader `leaktest_n` times (default 40), each time running only as far as the
+// stage (0 libnx + our init, 1 + SDL, 2 + the sound, 3 + the video backend and the overlay) and tearing it down again; logs/leaktest.csv gets one line per launch. The loader's process is shared
+// by every launch, so a leak of sessions or handles per launch ends the sequence with "2001-0132" after a number of launches that depends on how much each leaves behind: the last line of the
+// file is how many launches survived, and the stage where it drops names the code that leaks.
+static int g_leakStage = -2, g_leakN = 40, g_leakI;
+int CtSwitchLeakStage(void) {
+  if (g_leakStage != -2) return g_leakStage;
+  const char* e = getenv("CT_LEAKTEST"); g_leakStage = e ? atoi(e) : -1;
+  const char* n = getenv("CT_LEAKTEST_N"); if (n) g_leakN = atoi(n); if (g_leakN < 1) g_leakN = 1;
+  if (g_leakStage < 0) { remove("ct_leak_state"); return g_leakStage; }
+  FILE* f = fopen("ct_leak_state", "r"); long t0 = 0; int i = 0, st = -1;
+  if (f) { if (fscanf(f, "%d %d %ld", &st, &i, &t0) != 3) { i = 0; st = -1; } fclose(f); }
+  long now = (long)time(NULL);
+  if (st != g_leakStage || now - t0 > 60 || now < t0) i = 0;                  // another stage, or the last launch was long ago: a fresh test
+  g_leakI = i + 1;
+  mkdir("logs", 0777);
+  FILE* c = fopen("logs/leaktest.csv", "a"); if (c) { fprintf(c, "%ld,stage %d,launch %d of %d\n", now, g_leakStage, g_leakI, g_leakN); fclose(c); }
+  return g_leakStage;
+}
+void CtSwitchLeakNext(void) {
+  if (g_leakStage < 0) return;
+  fprintf(stderr, "[leaktest] stage %d: launch %d of %d done\n", g_leakStage, g_leakI, g_leakN); fflush(stderr);
+  if (g_leakI >= g_leakN) { remove("ct_leak_state"); fprintf(stderr, "[leaktest] stage %d: all %d launches survived\n", g_leakStage, g_leakN); return; }
+  FILE* f = fopen("ct_leak_state", "w"); if (f) { fprintf(f, "%d %d %ld\n", g_leakStage, g_leakI, (long)time(NULL)); fclose(f); }
+  if (g_argv0[0]) envSetNextLoad(g_argv0, g_argv0);
 }
 void CtSwitchLogFlush(void) { CtSwitchBackendTryEnd(); fflush(stdout); fflush(stderr); if (g_log) fflush(g_log); }
 int CtSwitchFastExitOk(void) { AppletType t = appletGetAppletType(); return t == AppletType_Application || t == AppletType_SystemApplication; }

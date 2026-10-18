@@ -15,7 +15,7 @@ set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 file(GLOB SNES_SRC CONFIGURE_DEPENDS ${ROOT}/snes/*.c)
 file(GLOB XLAT_SRC CONFIGURE_DEPENDS ${ROOT}/src/xlat/*.c)
 set(CT_SRC field scene lz assets ct_vm collision player world battle objslot tileanim menu menu_cost field_cost oam
-    settings present hoststats hostpool motion fieldnative move audio title_intro seq_ppu seq_xlat ct_cpu_infra rom_verify ct_lake_state
+    settings present bench hoststats hostpool motion fieldnative move audio title_intro seq_ppu seq_xlat ct_cpu_infra rom_verify ct_lake_state
     switch_platform savestate savestate_engine)
 list(TRANSFORM CT_SRC PREPEND ${ROOT}/src/)
 list(TRANSFORM CT_SRC APPEND .c)
@@ -49,6 +49,17 @@ set_source_files_properties(${ROOT}/src/overlay.cpp ${ROOT}/src/present_dk.cpp $
   PROPERTIES COMPILE_OPTIONS "-fno-exceptions;-fno-rtti")
 target_include_directories(ct_field PRIVATE ${ROOT}/src ${ROOT}/snes ${DEVKITPRO}/portlibs/switch/include/SDL2 ${DEVKITPRO}/portlibs/switch/include)
 target_compile_options(ct_field PRIVATE -O2 -march=armv8-a+crc+crypto -mtune=cortex-a57 -fno-strict-aliasing -w)
+# chain_probe.nro: the smallest self-relaunching program (switch/chain_probe.c), to tell the loader's own limit on chained launches from anything the game leaves open.
+add_executable(chain_probe ${CMAKE_CURRENT_SOURCE_DIR}/chain_probe.c)
+target_compile_options(chain_probe PRIVATE -O2 -w)
+nx_generate_nacp(chain_probe.nacp NAME "chain_probe" AUTHOR "ChronoTrigger-NX" VERSION "0.1")
+nx_create_nro(chain_probe NACP chain_probe.nacp)
+add_executable(chain_probe_big ${CMAKE_CURRENT_SOURCE_DIR}/chain_probe.c)                            # the same with a 28 MB array linked in: the size of the game's NRO
+target_compile_options(chain_probe_big PRIVATE -O2 -w)
+target_compile_definitions(chain_probe_big PRIVATE BIG_PAD)
+nx_generate_nacp(chain_probe_big.nacp NAME "chain_probe_big" AUTHOR "ChronoTrigger-NX" VERSION "0.1")
+nx_create_nro(chain_probe_big NACP chain_probe_big.nacp)
+
 # TWO CONFIGURATIONS, built side by side (switch/build_both.sh):
 #   default  (no option)           the console's own Mesa (portlibs libEGL, libdrm_nouveau) for SDL_Renderer and OpenGL, plus NVK for Vulkan as one
 #                                  isolated object (switch/get_mesa.sh). The known-good one.
@@ -72,7 +83,7 @@ if(CT_MESA_UNIFIED)
   target_link_libraries(ct_field PRIVATE SDL2 glad -Wl,--allow-multiple-definition -Wl,--start-group
     ${MU}/lib/libEGL.a ${MU}/lib/libGLESv2.a ${MU}/lib/libGLESv1_CM.a ${MU}/lib/libglapi.a ${MU}/lib/libvulkan.a ${MU_RUST} -Wl,--end-group
     zstd expat z deko3d stdc++ m)
-  nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C) - Mesa" AUTHOR "ChronoTrigger-NX" VERSION "0.6a")
+  nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C) - Mesa" AUTHOR "ChronoTrigger-NX" VERSION "0.6b")
   nx_create_nro(ct_field NACP ct_field.nacp)
   return()
 endif()
@@ -90,5 +101,5 @@ else()
   message(STATUS "Vulkan: third_party/mesa-switch not found (sh switch/get_mesa.sh) -- built without it")
 endif()
 target_link_libraries(ct_field PRIVATE ${CT_VULKAN_LIBS} SDL2 glad EGL glapi drm_nouveau ${CT_DK_LIB} stdc++ m)
-nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C)" AUTHOR "ChronoTrigger-NX" VERSION "0.6a")
+nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C)" AUTHOR "ChronoTrigger-NX" VERSION "0.6b")
 nx_create_nro(ct_field NACP ct_field.nacp)

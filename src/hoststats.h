@@ -24,11 +24,13 @@ void        CtStatsResolution(int renderW, int renderH, int shownW, int shownH, 
 // two marks inside an engine frame: 0 = its logic is done and the picture build begins, 1 = the picture is built.
 // The next CtStatsFrame reports logic (previous frame's end -> mark 0) and compose (mark 0 -> mark 1).
 void        CtStatsMark(int which);
+void        CtStatsReset(void);                    // zero every counter and start a new second (after the benchmark's own presents, which fed them)
 void        CtStatsClockReset(void);               // a pause that is not a frame's work (the options menu): the next frame starts now
 // LAPS inside a frame's picture build: the time since mark 0 or the previous lap goes to `part` (the battle compose's steps)
 void        CtStatsLap(int part);
 // the last full second as text lines for the HUD (NULL until one exists or when off); `n` receives the line count
 const char* const* CtStatsHud(int* n);
+void        CtStatsHudForce(const char* const* lines, int n);     // (the benchmark) show these lines whatever the HUD setting; NULL ends it
 #ifdef __cplusplus
 }
 #endif

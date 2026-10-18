@@ -21,6 +21,7 @@
 #define SDL_MAIN_HANDLED
 #include "rom_verify.h"
 #include "switch_platform.h"
+#include "bench.h"
 #ifdef __SWITCH__
 #define SDL_PollEvent(e) CtSwitchPollEvent(e)   /* (the dummy video driver's applet loop and touch screen: switch_platform.h) */
 #endif
@@ -9809,12 +9810,27 @@ static void fieldSsRegisterStatics(void) {
   snes_stateVars(CtSsVarAdd);                         // the logical-frame machinery's (a translated stage runs under it)
 }
 
+// THE LEAK TEST (switch_platform.c CtSwitchLeakStage): run only as far as `stage`, tear it down, and relaunch. 1 = SDL started, 2 = the sound up as well.
+static int fieldLeakFinish(int stage, SDL_AudioDeviceID audioDev, CtAudio* audio, int16_t* audioBuf) {
+  if (stage >= 2) { if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); } CtAudioFree(audio); free(audioBuf); }
+  CtHostThreadsStop(); CtSwitchThreadsStop();
+  if (stage >= 1) SDL_Quit();
+  CtSwitchReleaseGpu();
+  CtSwitchLeakNext();
+  CtSwitchTrace("leaktest: returning from main");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   fieldSsRegisterStatics();
   CtAudioClockHook = CtStatsNow;                  // (hoststats: the handshakes are timed)
+  CtRunSetName(argc > 0 ? argv[0] : NULL);       // (bench.h: the program's name and start time tag every log and summary)
   CtSwitchInit(&argc, &argv);                    // (the Switch host only: the folder, the log, the default arguments)
   CtSceneSetParallel(CtParallelFor);             // (the host pool: serial unless CT_THREADS / the Switch says otherwise)
   CtSwitchTrace("main");
+  CtSwitchLogResources("start");
+  const int leakStage = CtSwitchLeakStage();
+  if (leakStage == 0) return fieldLeakFinish(0, 0, NULL, NULL);
   dbgInit();                                     // cache the debug env flags (hot loops read dbg.*)
   // A PLAYER: one frame of SPC per displayed frame, so a translated stage's holds do not run the APU (snes.c, the
   // switch's note: the race's holds left the demo's sound 1.8 s behind). CT_XLAT_HOLDAPU=1 keeps the oracle's way.
@@ -11235,6 +11251,7 @@ int main(int argc, char** argv) {
 #ifdef __SWITCH__
   { CtSettingsLoad(1);                               // (the choice is needed now: deko3d and Vulkan cannot share the screen's window with SDL's own EGL surface)
     CtSettings* st0 = CtSettingsGet();
+    CtBenchChainStart(&st0->backend);                // (an automated pass over every backend sets this run's, and deals with one that crashed its start)
     if (st0->backend != CT_BACKEND_SDL && CtSwitchBackendTryPending()) {          // the last start with it did not get through
       fprintf(stderr, "[video] the last start with backend %d did not get through: back to SDL_Renderer\n", st0->backend); fflush(stderr);
       st0->backend = CT_BACKEND_SDL; CtSettingsSave(); CtSwitchBackendTryEnd();
@@ -11244,14 +11261,18 @@ int main(int argc, char** argv) {
 #endif
   CtSwitchTrace("SDL_Init");
   if (SDL_Init(SDL_INIT_VIDEO) != 0) { printf("FAIL: SDL_Init: %s\n", SDL_GetError()); return 4; }
+  CtSwitchLogResources("after SDL_Init(video)");
   // THE PLAYER'S OPTIONS (settings.h): read only by an interactive run -- a headless one (--selftest, CT_NOPACE, the
   // dummy video driver) keeps the defaults, so nothing a player saved can move a regression check.
   { const char* vd = SDL_GetCurrentVideoDriver();
     g_hostInteractive = !selftest && !g_noPace && !(vd && !strcmp(vd, "dummy"));
     if (getenv("CT_OVERLAY_SHOT") || getenv("CT_STATEMENU_TEST") || getenv("CT_HIDDEN_WINDOW")) g_hostInteractive = 1; }   // (the probe below: the overlay without a visible window)
   CtSettingsLoad(g_hostInteractive);
+  { int cb = CtBenchChainExpected(); if (cb >= 0) CtSettingsGet()->backend = cb; }   // (the settings were just read again from the file: an automated benchmark pass overrides the backend in memory only)
   if (g_hostInteractive && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) fieldPadOpen();
   int audioOn = (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0);
+  CtSwitchLogResources("after SDL audio + controllers");
+  if (leakStage == 1) return fieldLeakFinish(1, 0, NULL, NULL);
   SDL_AudioDeviceID audioDev = 0;
   int audioHz = 48000, audioSamplesPerFrame = 0;
   int16_t* audioBuf = NULL;
@@ -11351,15 +11372,28 @@ int main(int argc, char** argv) {
     pc.fullscreen = st->fullscreen; pc.backend = st->backend; pc.sdlDriver = st->renderDriver; pc.vsync = st->vsync;
     pc.hidden = getenv("CT_OVERLAY_SHOT") != NULL || getenv("CT_STATEMENU_TEST") != NULL || getenv("CT_HIDDEN_WINDOW") != NULL;     // (the probe: no window on the player's screen)
   }
+  if (leakStage == 2) return fieldLeakFinish(2, audioDev, audio, audioBuf);
   CtSwitchTrace("creating the window");
   CtPresenter* pr = CtPresentCreate(&pc);
   CtSwitchTrace("window up");
+  CtSwitchLogResources("after the presenter");
   if (!pr) { printf("FAIL: no window: %s\n", SDL_GetError()); return 4; }
   SDL_Window* win = CtPresentWindow(pr);
   if (g_hostInteractive) {                             // the picture is placed by hostDstRect, the overlay on top
     hostApplyVideo(pr);
     fprintf(stderr, "[video] %s\n", CtPresentName(pr));
+    { const CtSettings* bs = CtSettingsGet(); char b[300];                       // what a summary needs to say about this run
+      CtBenchSetBackend(CtPresentBackendId(pr), CtPresentName(pr));
+      snprintf(b, sizeof b, "settings: backend %d, widescreen %d, render scale %d, frames between %d, vsync %d, scale mode %d, aspect %d, filter %s, hud %d, clocks %d", bs->backend, bs->widescreen,
+               bs->renderScale, bs->interpolate, bs->vsync, bs->scaleMode, bs->aspect, bs->linearFilter ? "linear" : "nearest", bs->statsHud, bs->clocks); CtBenchInfo(b);
+#ifdef CT_MESA_UNIFIED
+      CtBenchInfo("build: everything on mesa-switch's Mesa (ct_field_mesa)");
+#else
+      CtBenchInfo("build: the console's Mesa for SDL_Renderer / OpenGL, NVK for Vulkan (ct_field)");
+#endif
+      SDL_version sv; SDL_GetVersion(&sv); snprintf(b, sizeof b, "SDL %d.%d.%d, picture %dx%d, output size reported by the presenter follows", sv.major, sv.minor, sv.patch, CAMW, CAMH); CtBenchInfo(b); }
     if (CtOverlayInit(pr)) fprintf(stderr, "[options] F1 or L3+R3: options (%s)\n", CtSettingsPath());
+    CtSwitchLogResources("after the overlay");
     CtPresentSetAsync(pr, 1);                        // (the render thread: only where present.c allows it -- the Switch, or CT_ASYNC_PRESENT=1)
   }
 
@@ -11719,7 +11753,15 @@ int main(int argc, char** argv) {
   int atbTypeStep = 1 << 20;
 
 #include "ss_main_vars.inc"                       /* the host loop's variables that are a game's state (savestate_engine.h SSV) */
+  CtSwitchLogResources("running");
+  if (leakStage == 3) running = 0;                  // (the leak test: the backend and the overlay are up; end here)
+  if (CtBenchMode() >= 2 && leakStage < 0) {                         // bench=2/3/4: the presentation micro-benchmark first (bench.h); 4 goes on into the game, the rest end here
+    CtPresentBench(pr);
+    CtStatsReset();                                   // (its timed calls fed the counters: the game run starts from zero)
+    if (CtBenchMode() != 4) running = 0;
+  }
   while (running && !g_shotsExit) {
+    if (CtBenchEngineExpired()) { fprintf(stderr, "[bench] the timed run is over (%d s)\n", CtBenchSecs()); running = 0; break; }
     fieldIrqPreFlip = 0;                             // set by this frame's return-chain wait, if any (the battle's ack)
     // C0/000E, THE COLD INIT, reached from a running game this frame (the demo battle's CF/E702, the defeat's C0/02CA):
     // requested where the ROM jumps, performed once below the battle block.
@@ -19776,17 +19818,19 @@ int main(int argc, char** argv) {
   // THE SWITCH'S EXIT (ct_boost.ini `exit=`, default 1; found by trying them on the console -- each of these ended in the system's error dialog before the default
   // was chosen, see docs/SWITCH.md): 0 = every teardown, then return from main; 1 = no teardown of EGL / the GPU / SDL, return from main; 2 = no teardown, end the
   // process at once; 3 = every teardown, end the process. Every step is logged and flushed, so the log says how far an exit got.
+  CtBenchWrite(1);                                    // the run's summary (logs/bench_*.txt)
   { int em = CtSwitchExitMode(), full = (em == 0 || em == 3), kill = (em == 2 || em == 3);
     char b[80]; snprintf(b, sizeof b, "exit mode %d (%s teardown, then %s)", em, full ? "full" : "no", kill ? "end the process" : "return from main"); CtSwitchTrace(b);
+    CtSwitchLogResources("exit: before any teardown");
     CtPresentStopThread(pr); CtSwitchTrace("exit: render thread joined");           // EVERY thread of ours ends before the program returns to the homebrew loader:
     CtHostThreadsStop(); CtSwitchTrace("exit: pool and sound threads joined");     // one left running makes the loader's unmapping fail (the system's error dialog)
-    CtSwitchThreadsStop(); CtSwitchTrace("exit: clock probes joined");
+    CtSwitchThreadsStop(); CtSwitchTrace("exit: clock probes joined"); CtSwitchLogResources("exit: threads joined");
     if (full) {
-      CtOverlayShutdown(); CtSwitchTrace("exit: overlay down");
-      CtPresentDestroy(pr); (void)win; CtSwitchTrace("exit: presenter down");
-      SDL_Quit(); CtSwitchTrace("exit: SDL down");
+      CtOverlayShutdown(); CtSwitchTrace("exit: overlay down"); CtSwitchLogResources("exit: overlay down");
+      CtPresentDestroy(pr); (void)win; CtSwitchTrace("exit: presenter down"); CtSwitchLogResources("exit: presenter down");
+      SDL_Quit(); CtSwitchTrace("exit: SDL down"); CtSwitchLogResources("exit: SDL down");
     }
-    CtSwitchReleaseGpu(); CtSwitchTrace("exit: GPU services released");
+    CtSwitchReleaseGpu(); CtSwitchTrace("exit: GPU services released"); CtSwitchLogResources("end of run");
     CtSwitchLogFlush();
     if (kill && CtSwitchFastExitOk()) CtSwitchExit();
   }
@@ -19794,6 +19838,9 @@ int main(int argc, char** argv) {
   // (CD/1680 kills a slot on an opcode this port has not derived; the count is cumulative over the process).
   if (getenv("CT_BATTLE_TRACE")) printf("fleeprog: run total stops=%d\n", CtBattleFxProgStops());
   CtAssetsClose(&assets);
+  CtBenchOneShotDone();
+  CtSwitchLeakNext();
+  CtBenchChainNext();                                 // an automated pass over every backend: the next one is launched when this program returns
   CtSwitchTrace("exit: returning from main");
   return 0;
 }

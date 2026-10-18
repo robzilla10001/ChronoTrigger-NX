@@ -11,6 +11,8 @@
 #include "hoststats.h"
 #include "hostpool.h"
 #include "switch_platform.h"
+#include "bench.h"
+#include "settings.h"
 #include "overlay.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +49,9 @@ typedef unsigned int GLbitfield_; typedef float GLfloat_;
 #define CTGL_BACK 0x0405
 #define CTGL_VERSION 0x1F02
 #define CTGL_RENDERER 0x1F01
+#define CTGL_TIME_ELAPSED 0x88BF
+#define CTGL_QUERY_RESULT 0x8866
+#define CTGL_QUERY_RESULT_AVAILABLE 0x8867
 static struct {
   void (CTGL_API* GenTextures)(GLsizei_, GLuint_*);
   void (CTGL_API* DeleteTextures)(GLsizei_, const GLuint_*);
@@ -68,6 +73,12 @@ static struct {
   void (CTGL_API* ReadBuffer)(GLenum_);
   void (CTGL_API* ReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void*);
   const unsigned char* (CTGL_API* GetString)(GLenum_);
+  void (CTGL_API* GenQueries)(GLsizei_, GLuint_*);                       // (timer queries: optional)
+  void (CTGL_API* DeleteQueries)(GLsizei_, const GLuint_*);
+  void (CTGL_API* BeginQuery)(GLenum_, GLuint_);
+  void (CTGL_API* EndQuery)(GLenum_);
+  void (CTGL_API* GetQueryObjectiv)(GLuint_, GLenum_, GLint_*);
+  void (CTGL_API* GetQueryObjectui64v)(GLuint_, GLenum_, unsigned long long*);
 } gl;
 static int glLoad(void) {
 #define L(name) if (!(*(void**)&gl.name = SDL_GL_GetProcAddress("gl" #name))) { fprintf(stderr, "[video] OpenGL: no gl%s\n", #name); return 0; }
@@ -75,15 +86,25 @@ static int glLoad(void) {
   L(GenFramebuffers) L(DeleteFramebuffers) L(BindFramebuffer) L(FramebufferTexture2D) L(CheckFramebufferStatus)
   L(BlitFramebuffer) L(ClearColor) L(Clear) L(Viewport) L(Disable) L(ReadBuffer) L(ReadPixels) L(GetString)
 #undef L
+  *(void**)&gl.GenQueries = SDL_GL_GetProcAddress("glGenQueries"); *(void**)&gl.DeleteQueries = SDL_GL_GetProcAddress("glDeleteQueries");
+  *(void**)&gl.BeginQuery = SDL_GL_GetProcAddress("glBeginQuery"); *(void**)&gl.EndQuery = SDL_GL_GetProcAddress("glEndQuery");
+  *(void**)&gl.GetQueryObjectiv = SDL_GL_GetProcAddress("glGetQueryObjectiv"); *(void**)&gl.GetQueryObjectui64v = SDL_GL_GetProcAddress("glGetQueryObjectui64v");
   return 1;
 }
 
 static void presentStop(struct CtPresenter* p);
+// Per-frame GPU time and the time the CPU is blocked on the GPU (bench.h): 1 when a new GPU time has come in since `*seq`, -1 backends have none (SDL_Renderer).
+int CtPresentGpuMs(struct CtPresenter* p, long* seq, double* ms);
+double CtPresentWaitedMs(struct CtPresenter* p);
+// THE SDL RENDER THREAD'S OWN FIGURES (bench.h): 1 when the thread has finished a frame since *seq (then its times for that frame), 0 when not, -1 when there is no render thread.
+int CtPresentRenderThread(struct CtPresenter* p, long* seq, double* work, double* up, double* wait);
+void CtPresentRenderThreadTotals(struct CtPresenter* p, long* shown, long* replaced);
 typedef struct { int w, h, hasDst, linear, nHud; SDL_Rect dst; char hud[9][96]; } PJob;   // one frame's draw, handed to the render thread
 struct CtPresenter {
   int backend;
   SDL_Window* win;
   int picW, picH;
+  int texW, texH;            // GPU backends: the size of the texture the backend holds. It is the SOURCE size when the GPU does the k-times scaling (CtPresentUploadScaled), else picW x picH
   char name[160];
   // SDL_Renderer
   SDL_Renderer* ren;
@@ -98,6 +119,7 @@ struct CtPresenter {
   // OpenGL
   SDL_GLContext ctx;
   GLuint_ glTex, glFbo;
+  GLuint_ glQ[2]; int glQi, glQarmed[2]; double glGpuMs; long glGpuSeq;    // timer queries around the draw, alternating: the last finished one is read without waiting
   GLuint_ hudTex, hudFbo; int hudW, hudH; char hudKey[1024];   // the HUD as a small texture blitted at the corner (no ImGui frame, no shader)
   int glLinear;
   // THE RENDER THREAD (SDL_Renderer): see present.h
@@ -110,6 +132,7 @@ struct CtPresenter {
   SDL_Rect pdst; int phasDst, plinear;         // the draw, recorded for the frame
   PJob jobs[3];                                // (per staging buffer)
   SDL_Texture* tex2; int linear2, flip;        // the second texture: uploads alternate, so one is never written while the GPU still reads the other
+  volatile long rtSeq, rtShownTotal, rtReplacedTotal;            // cumulative: frames the thread finished, frames it showed, frames replaced before it got to them (the benchmark reads these)
   volatile double rtWork, rtWait, rtUp; volatile int rtNew;     // the thread's own timings, read by Swap (stats are the main thread's)
 };
 
@@ -160,6 +183,7 @@ static int glStart(CtPresenter* p, const CtPresentConfig* c) {
 }
 static void glStop(CtPresenter* p) {
   if (p->ctx) {
+    if (p->glQ[0] && gl.DeleteQueries) gl.DeleteQueries(2, p->glQ);
     if (p->hudFbo) gl.DeleteFramebuffers(1, &p->hudFbo);
     if (p->hudTex) gl.DeleteTextures(1, &p->hudTex);
     if (p->glFbo) gl.DeleteFramebuffers(1, &p->glFbo);
@@ -179,7 +203,7 @@ static SDL_Window* makeWindow(const CtPresentConfig* c, Uint32 api) {
 CtPresenter* CtPresentCreate(const CtPresentConfig* c) {
   CtPresenter* p = (CtPresenter*)calloc(1, sizeof *p);
   if (!p) return NULL;
-  p->picW = c->picW; p->picH = c->picH;
+  p->picW = c->picW; p->picH = c->picH; p->texW = c->picW; p->texH = c->picH;
   if (c->backend == CT_BACKEND_OPENGL && !c->software) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -344,7 +368,7 @@ static int renderThread(void* arg) {
     SDL_RenderPresent(p->ren);                       // (the vsync wait)
     double t2 = statsNow();
     SDL_GL_MakeCurrent(p->win, NULL);                // let the main thread take the context at a sync point (a no-op without GL)
-    p->rtWork = t1 - t0; p->rtWait = t2 - t1; p->rtUp = tu - t0; p->rtNew = 1;
+    p->rtWork = t1 - t0; p->rtWait = t2 - t1; p->rtUp = tu - t0; p->rtNew = 1; p->rtShownTotal++; p->rtSeq++;
     SDL_AtomicAdd(&p->rtShown, 1);
     if (chk) { frames++; if (fnvBuf(p->stg[b], (size_t)job.w * job.h) != h0) { races++; fprintf(stderr, "[present] RACE: staging buffer %d changed during frame %ld\n", b, frames); }
                if (frames % 300 == 0) fprintf(stderr, "[present] render thread: %ld frames, %ld races\n", frames, races); }
@@ -399,8 +423,32 @@ static void presentStop(CtPresenter* p) {
 
 void CtPresentStopThread(CtPresenter* p) { if (p) presentStop(p); }
 
+// The GPU backends keep the texture at texW x texH, which is picW x picH (the picture as the engine sizes it) or, when the GPU does the plain k-times scaling, the 1x source: the blit / sampler
+// stretches it to the same pixels with nearest filtering (floor of floor is floor), so a frame costs w x 224 pixels of conversion and upload instead of (4w) x 896.
+static int gpuTexSet(CtPresenter* p, int w, int h) {
+  if (w == p->texW && h == p->texH) return 1;
+  int ok = 0;
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) ok = CtDkSetPicSize(p->dk, w, h);
+#endif
+#ifdef CT_HAVE_VULKAN
+  if (p->backend == CT_BACKEND_VULKAN) ok = CtVkSetPicSize(p->vk, w, h);
+#endif
+  if (p->backend == CT_BACKEND_OPENGL) {
+    gl.BindTexture(CTGL_TEXTURE_2D, p->glTex);
+    gl.TexImage2D(CTGL_TEXTURE_2D, 0, CTGL_RGB8, w, h, 0, CTGL_RGB, CTGL_UNSIGNED_BYTE, NULL);
+    ok = 1;
+  }
+  if (ok) { p->texW = w; p->texH = h; }
+  return ok;
+}
+static void presentUpload(CtPresenter* p, const uint8_t* rgb);
 void CtPresentUpload(CtPresenter* p, const uint8_t* rgb) {
   if (!p) return;
+  if (p->backend != CT_BACKEND_SDL && !gpuTexSet(p, p->picW, p->picH)) return;
+  presentUpload(p, rgb);
+}
+static void presentUpload(CtPresenter* p, const uint8_t* rgb) {          // (the texture is already the size of `rgb`)
   double st0 = statsNow();
 #ifdef CT_HAVE_DEKO3D
   if (p->backend == CT_BACKEND_DEKO3D) { CtDkUpload(p->dk, rgb); CtStatsPresent(CT_ST_UPLOAD, statsNow() - st0); return; }
@@ -411,7 +459,7 @@ void CtPresentUpload(CtPresenter* p, const uint8_t* rgb) {
   if (p->backend == CT_BACKEND_OPENGL) {
     gl.BindTexture(CTGL_TEXTURE_2D, p->glTex);
     gl.PixelStorei(CTGL_UNPACK_ALIGNMENT, 1);
-    gl.TexSubImage2D(CTGL_TEXTURE_2D, 0, 0, 0, p->picW, p->picH, CTGL_RGB, CTGL_UNSIGNED_BYTE, rgb);
+    gl.TexSubImage2D(CTGL_TEXTURE_2D, 0, 0, 0, p->texW, p->texH, CTGL_RGB, CTGL_UNSIGNED_BYTE, rgb);
   } else {
     size_t n = (size_t)p->picW * p->picH;
     if (p->async) {                                  // into the staging buffer the thread is NOT reading (the other one)
@@ -445,7 +493,14 @@ static void upRows(void* ctx, int y0, int y1) {
   }
 }
 int CtPresentUploadScaled(CtPresenter* p, const uint8_t* rgb, int w, int k) {
-  if (!p || p->backend != CT_BACKEND_SDL || k < 1 || p->picW != w * k || p->picH % k) return 0;
+  if (!p || k < 1 || p->picW != w * k || p->picH % k) return 0;
+  if (p->backend != CT_BACKEND_SDL) {                // the GPU backends: upload the 1x source, the GPU stretches it (nearest only: a linear filter would blur what the k-times copy keeps sharp)
+    static int off = -1; if (off < 0) off = getenv("CT_NO_GPU_SCALE") != NULL;      // (A/B switch: the CPU upscale)
+    if (off || k == 1 || CtSettingsGet()->linearFilter) return 0;
+    if (!gpuTexSet(p, w, p->picH / k)) return 0;
+    presentUpload(p, rgb);                           // (times itself)
+    return 1;
+  }
   double st0 = statsNow();
   const int rows = p->picH / k;
   size_t n = (size_t)p->picW * p->picH;
@@ -470,17 +525,12 @@ int CtPresentUploadScaled(CtPresenter* p, const uint8_t* rgb, int w, int k) {
 void CtPresentSetPicSize(CtPresenter* p, int w, int h) {
   if (!p || w <= 0 || h <= 0 || (w == p->picW && h == p->picH)) return;
 #ifdef CT_HAVE_DEKO3D
-  if (p->backend == CT_BACKEND_DEKO3D) { if (CtDkSetPicSize(p->dk, w, h)) { p->picW = w; p->picH = h; } return; }
+  if (p->backend == CT_BACKEND_DEKO3D) { p->picW = w; p->picH = h; return; }          // (the backend's texture follows at the next upload: gpuTexSet)
 #endif
 #ifdef CT_HAVE_VULKAN
-  if (p->backend == CT_BACKEND_VULKAN) { if (CtVkSetPicSize(p->vk, w, h)) { p->picW = w; p->picH = h; } return; }
+  if (p->backend == CT_BACKEND_VULKAN) { p->picW = w; p->picH = h; return; }
 #endif
-  if (p->backend == CT_BACKEND_OPENGL) {
-    gl.BindTexture(CTGL_TEXTURE_2D, p->glTex);
-    gl.TexImage2D(CTGL_TEXTURE_2D, 0, CTGL_RGB8, w, h, 0, CTGL_RGB, CTGL_UNSIGNED_BYTE, NULL);
-    p->picW = w; p->picH = h;
-    return;
-  }
+  if (p->backend == CT_BACKEND_OPENGL) { p->picW = w; p->picH = h; return; }
   CtPresentSync(p);                                  // (the render thread must not be using the texture)
   SDL_Texture* t = SDL_CreateTexture(p->ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
   if (!t) return;
@@ -525,13 +575,21 @@ void CtPresentDraw(CtPresenter* p, const SDL_Rect* dst, int linear) {
     gl.BindFramebuffer(CTGL_DRAW_FRAMEBUFFER, 0);
     gl.Disable(CTGL_SCISSOR_TEST);
     gl.Viewport(0, 0, ow, oh);
+    if (gl.GenQueries && gl.BeginQuery && gl.GetQueryObjectui64v) {                    // GPU timing: read the other query if it has finished, start this one
+      if (!p->glQ[0]) gl.GenQueries(2, p->glQ);
+      int o = p->glQi ^ 1;
+      if (p->glQarmed[o]) { GLint_ av = 0; gl.GetQueryObjectiv(p->glQ[o], CTGL_QUERY_RESULT_AVAILABLE, &av);
+        if (av) { unsigned long long ns = 0; gl.GetQueryObjectui64v(p->glQ[o], CTGL_QUERY_RESULT, &ns); p->glGpuMs = (double)ns / 1e6; p->glGpuSeq++; p->glQarmed[o] = 0; } }
+      if (!p->glQarmed[p->glQi]) { gl.BeginQuery(CTGL_TIME_ELAPSED, p->glQ[p->glQi]); p->glQarmed[p->glQi] = 2; }
+    }
     gl.ClearColor(0, 0, 0, 1); gl.Clear(CTGL_COLOR_BUFFER_BIT);
     SDL_Rect d = dst ? *dst : (SDL_Rect){ 0, 0, ow, oh };
     gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, p->glFbo);
     // GL's rows count up from the bottom: the frame's row 0 (its top) goes to the rectangle's top edge, oh - d.y
-    gl.BlitFramebuffer(0, 0, p->picW, p->picH, d.x, oh - d.y, d.x + d.w, oh - d.y - d.h, CTGL_COLOR_BUFFER_BIT,
+    gl.BlitFramebuffer(0, 0, p->texW, p->texH, d.x, oh - d.y, d.x + d.w, oh - d.y - d.h, CTGL_COLOR_BUFFER_BIT,
                        linear ? CTGL_LINEAR : CTGL_NEAREST);
     gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, 0);
+    if (p->glQarmed[p->glQi] == 2) { gl.EndQuery(CTGL_TIME_ELAPSED); p->glQarmed[p->glQi] = 1; p->glQi ^= 1; }
     return;
   }
   if (p->async) { p->phasDst = dst != NULL; if (dst) p->pdst = *dst; p->plinear = linear; return; }   // (the thread draws it)
@@ -588,6 +646,110 @@ static void glHudDraw(CtPresenter* p, const char* const* ln, int n) {
   gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, 0);
 }
 
+int CtPresentBackendAvailable(int id) {
+  if (id == CT_BACKEND_SDL || id == CT_BACKEND_OPENGL) return 1;
+#ifdef CT_HAVE_VULKAN
+  if (id == CT_BACKEND_VULKAN) return 1;
+#endif
+#ifdef CT_HAVE_DEKO3D
+  if (id == CT_BACKEND_DEKO3D) return 1;
+#endif
+  return 0;
+}
+int CtPresentBackendId(const CtPresenter* p) { return p ? p->backend : -1; }
+
+// THE PRESENTATION MICRO-BENCHMARK (bench.h). The backend's own cost with no engine work behind it: a synthetic picture of each size the game uses is uploaded, drawn into the window
+// and swapped, with every call timed, vsync off (what the backend can sustain) and vsync on (how steady it presents), then the HUD, the mods menu and the linear filter at 4x.
+static void benchPattern(uint8_t* rgb, int w, int h, int phase) {
+  for (int y = 0; y < h; y++) {
+    uint8_t* r = rgb + (size_t)y * (size_t)w * 3;
+    for (int x = 0; x < w; x++) {
+      int v = ((x + phase * 7) ^ (y + phase * 3)) & 255;
+      r[3 * x] = (uint8_t)v; r[3 * x + 1] = (uint8_t)(255 - v); r[3 * x + 2] = (uint8_t)((x * 255) / (w ? w : 1));
+    }
+  }
+}
+static int g_benchGk;                            // >1: the phase uploads the 1x source and lets CtPresentUploadScaled scale it (the GPU on the GPU backends, the fused pass on SDL)
+static void benchUp(CtPresenter* p, const uint8_t* rgb, int w) { if (g_benchGk > 1) CtPresentUploadScaled(p, rgb, w / g_benchGk, g_benchGk); else CtPresentUpload(p, rgb); }
+static void benchPhase(CtPresenter* p, const char* phase, int w, int h, int vsync, int linear, int hud, int menu, int frames, uint8_t* const bufs[4]) {
+  static const char* const kHud[9] = { "ENGINE 60.0 FPS  SHOWN 60.0 FPS", "FRAME 16.7 AVG 16.9 MAX MS", "WORK 6.1 AVG 9.8 MAX MS  SLEEP 10.5", "AUDIO 0.4 PICT 1.2 TITLE 0.0 UP 0.3 SWAP 0.1 MS",
+                                       "OVER 16.7 MS 0  OVER 33 MS 0  SKIP 0  ARENA 0.0 FX 0.0", "AUDIO Q 8000-17000 B DROP 0 EMPTY 0", "CPU 1785 GPU 768 MEM 1600 MHZ  FIELD  LOC 000  LOGIC 1.0 COMPOSE 2.0 MS",
+                                       "RENDER 1024X896  SCALE 4X  WIDE OFF  BETWEEN OFF", "SHOWN 1024X896 IN 1920X1080  FIT 8:7 NEAREST" };
+  CtPresentSetPicSize(p, w, h);
+  CtPresentSetVsync(p, vsync);
+  CtStatsHudForce(hud ? kHud : NULL, hud ? 9 : 0);
+  int ow = 0, oh = 0; CtPresentOutputSize(p, &ow, &oh);
+  double sc = (double)ow / w < (double)oh / h ? (double)ow / w : (double)oh / h; if (sc <= 0) sc = 1;
+  SDL_Rect dst; dst.w = (int)(w * sc); dst.h = (int)(h * sc); dst.x = (ow - dst.w) / 2; dst.y = (oh - dst.h) / 2;
+  double* t = (double*)calloc((size_t)frames * 10, sizeof(double)); if (!t) return;
+  double *tot = t, *up = t + frames, *dr = t + 2 * frames, *sw = t + 3 * frames, *ov = t + 4 * frames, *wt = t + 5 * frames, *gp = t + 6 * frames;
+  double *rw = t + 7 * frames, *ru = t + 8 * frames, *rv = t + 9 * frames;                  // the SDL render thread's work, upload and present wait, one per frame it finished
+  int ngp = 0, nrt = 0; long gseq = 0, rseq = 0; double gms = 0, a1, a2, a3; CtPresentGpuMs(p, &gseq, &gms);
+  for (int i = 0; i < 30; i++) {                                                       // warm-up: the first frames build pipelines, textures and caches
+    benchUp(p, bufs[i & 3], w); CtPresentDraw(p, &dst, linear);
+    if (menu) { CtOverlayFrame(); CtOverlayRender(); }
+    CtPresentSwap(p);
+  }
+  CtPresentSync(p);
+  CtPresentRenderThread(p, &rseq, &a1, &a2, &a3);                                           // (start from here)
+  long shown0, repl0; CtPresentRenderThreadTotals(p, &shown0, &repl0);
+  double wall0 = statsNow(), prev = wall0, wait0 = CtPresentWaitedMs(p);
+  for (int i = 0; i < frames; i++) {
+    double a = statsNow();
+    benchUp(p, bufs[i & 3], w);
+    double b = statsNow();
+    CtPresentDraw(p, &dst, linear);
+    double c = statsNow(), o = 0;
+    if (menu) { CtOverlayFrame(); CtOverlayRender(); o = statsNow() - c; }
+    double d = statsNow();
+    CtPresentSwap(p);
+    double e = statsNow();
+    if (p->async) CtPresentSync(p);                        // the SDL render thread: wait for it to show this frame, so none is replaced and the frame's whole cost (and the thread's) is measured
+    double e2 = statsNow();
+    up[i] = b - a; dr[i] = c - b; ov[i] = o; sw[i] = e - d; tot[i] = e2 - prev; prev = e2;
+    { double w1 = CtPresentWaitedMs(p); wt[i] = (w1 - wait0) + (e2 - e); wait0 = w1; }
+    if (CtPresentGpuMs(p, &gseq, &gms) == 1 && ngp < frames) gp[ngp++] = gms;
+    if (CtPresentRenderThread(p, &rseq, &a1, &a2, &a3) == 1 && nrt < frames) { rw[nrt] = a1; ru[nrt] = a2; rv[nrt] = a3; nrt++; }
+  }
+  CtPresentSync(p);
+  double wall = (statsNow() - wall0) / 1000.0;
+  CtBenchRt rt = { rw, ru, rv, nrt, 0, 0 };
+  { long sh1, rp1; CtPresentRenderThreadTotals(p, &sh1, &rp1); rt.shown = sh1 - shown0; rt.replaced = rp1 - repl0; }
+  CtBenchPresentRow(phase, w, h, ow, oh, frames, wall, tot, up, dr, sw, ov, wt, gp, ngp, nrt >= 0 && p->async ? &rt : NULL);
+  CtStatsHudForce(NULL, 0);
+  free(t);
+}
+void CtPresentBench(CtPresenter* p) {
+  if (!p) return;
+  static const int sizes[4][2] = { { 256, 224 }, { 512, 448 }, { 1024, 896 }, { 1593, 896 } };   // 1x, 2x, 4x, 4x widescreen 16:9
+  static const char* const names[4] = { "1x", "2x", "4x", "4x-16:9" };
+  fprintf(stderr, "[bench] presentation micro-benchmark: backend %s\n", CtPresentName(p)); fflush(stderr);
+  CtPresentSetAsync(p, 1);
+  for (int s = 0; s < 4; s++) {
+    int w = sizes[s][0], h = sizes[s][1];
+    uint8_t* bufs[4]; int ok = 1;
+    for (int i = 0; i < 4; i++) { bufs[i] = (uint8_t*)malloc((size_t)w * (size_t)h * 3); if (!bufs[i]) ok = 0; else benchPattern(bufs[i], w, h, i); }
+    if (ok) {
+      char ph[64];
+      snprintf(ph, sizeof ph, "%s vsync-off", names[s]); benchPhase(p, ph, w, h, 0, 0, 0, 0, 300, bufs);
+      snprintf(ph, sizeof ph, "%s vsync-on", names[s]);  benchPhase(p, ph, w, h, 1, 0, 0, 0, 240, bufs);
+      if (s == 2) {
+        benchPhase(p, "4x linear vsync-off", w, h, 0, 1, 0, 0, 300, bufs);
+        benchPhase(p, "4x +HUD vsync-off", w, h, 0, 0, 1, 0, 300, bufs);
+        benchPhase(p, "4x +mods-menu vsync-off", w, h, 0, 0, 0, 1, 200, bufs);
+        g_benchGk = 4;                                                                         // the same 4x picture from the 1x source: scaled by the GPU (SDL: the fused CPU pass)
+        benchPhase(p, "4x scaled-up vsync-off", w, h, 0, 0, 0, 0, 300, bufs);
+        benchPhase(p, "4x scaled-up vsync-on", w, h, 1, 0, 0, 0, 240, bufs);
+        benchPhase(p, "4x scaled-up +HUD vsync-off", w, h, 0, 0, 1, 0, 300, bufs);
+        g_benchGk = 0;
+      }
+    }
+    for (int i = 0; i < 4; i++) free(bufs[i]);
+  }
+  CtPresentSetVsync(p, CtSettingsGet()->vsync);
+  fprintf(stderr, "[bench] presentation micro-benchmark done\n"); fflush(stderr);
+}
+
 void CtPresentDrawHud(CtPresenter* p) {                  // (the OpenGL backend's HUD; the swap calls it)
   if (!p || p->backend != CT_BACKEND_OPENGL || p->logical) return;
   int n = 0; const char* const* ln = CtStatsHud(&n);
@@ -595,14 +757,19 @@ void CtPresentDrawHud(CtPresenter* p) {                  // (the OpenGL backend'
   glHudDraw(p, ln, n);
 }
 
+static void benchExtra(CtPresenter* p) {                  // once a frame, after the backend's swap: the GPU's time and the CPU's wait, for the run's summary
+  static long seq; static double lastWait; double g = 0;
+  int has = CtPresentGpuMs(p, &seq, &g) == 1;
+  double w = CtPresentWaitedMs(p); CtBenchExtra(g, has, w - lastWait); lastWait = w;
+}
 void CtPresentSwap(CtPresenter* p) {
   if (!p) return;
   if (p->backend != CT_BACKEND_SDL && p->backend != CT_BACKEND_OPENGL && !p->logical) { int n = 0; const char* const* ln = CtStatsHud(&n); CtOverlayHud(ln, n); }   // the other backends' HUD, drawn by the overlay (SDL_Renderer draws its own, below)
 #ifdef CT_HAVE_DEKO3D
-  if (p->backend == CT_BACKEND_DEKO3D) { double t0 = statsNow(); CtDkSwap(p->dk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); return; }
+  if (p->backend == CT_BACKEND_DEKO3D) { double t0 = statsNow(); CtDkSwap(p->dk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); benchExtra(p); return; }
 #endif
 #ifdef CT_HAVE_VULKAN
-  if (p->backend == CT_BACKEND_VULKAN) { double t0 = statsNow(); CtVkSwap(p->vk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); return; }
+  if (p->backend == CT_BACKEND_VULKAN) { double t0 = statsNow(); CtVkSwap(p->vk); CtStatsPresent(CT_ST_SWAP, statsNow() - t0); benchExtra(p); return; }
 #endif
   double st0 = statsNow();
   if (p->backend != CT_BACKEND_SDL && !p->logical) { int n = 0; const char* const* ln = CtStatsHud(&n); CtOverlayHud(ln, n); }   // (SDL_Renderer draws its own, below)
@@ -620,13 +787,13 @@ void CtPresentSwap(CtPresenter* p) {
     for (int i = 0; i < 3; i++) if (i != p->pending && i != p->inflight) { p->wbuf = i; break; }   // (the third buffer is always free)
     SDL_CondBroadcast(p->cv);
     SDL_UnlockMutex(p->mu);
-    if (replaced) CtStatsPresentSkipped();
+    if (replaced) { CtStatsPresentSkipped(); p->rtReplacedTotal++; }
     if (p->rtNew) { CtStatsPresent(CT_ST_RWORK, p->rtWork); CtStatsPresent(CT_ST_RWAIT, p->rtWait); CtStatsPresent(CT_ST_RUP, p->rtUp); p->rtNew = 0; }
     CtStatsShownFrames(SDL_AtomicSet(&p->rtShown, 0));
     CtStatsPresent(CT_ST_SWAP, statsNow() - st0);
     return;
   }
-  if (p->backend == CT_BACKEND_OPENGL) { CtPresentDrawHud(p); SDL_GL_SwapWindow(p->win); }
+  if (p->backend == CT_BACKEND_OPENGL) { CtPresentDrawHud(p); SDL_GL_SwapWindow(p->win); benchExtra(p); }
   else { if (!p->logical) drawHud(p->ren); SDL_RenderPresent(p->ren); }
   CtStatsPresent(CT_ST_SWAP, statsNow() - st0);
 }
@@ -673,3 +840,37 @@ int CtPresentSaveBMP(CtPresenter* p, const char* path) {
   SDL_FreeSurface(sf);
   return ok;
 }
+
+int CtPresentGpuMs(CtPresenter* p, long* seq, double* ms) {
+  if (!p || !seq || !ms) return 0;
+  long cur = *seq; double v = 0;
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) { v = CtDkGpuMs(p->dk, &cur); }
+  else
+#endif
+#ifdef CT_HAVE_VULKAN
+  if (p->backend == CT_BACKEND_VULKAN) { v = CtVkGpuMs(p->vk, &cur); }
+  else
+#endif
+  if (p->backend == CT_BACKEND_OPENGL) { v = p->glGpuMs; cur = p->glGpuSeq; }
+  else return -1;
+  if (cur == *seq) return 0;
+  *seq = cur; *ms = v; return 1;
+}
+double CtPresentWaitedMs(CtPresenter* p) {
+  if (!p) return 0;
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) return CtDkWaitedMs(p->dk);
+#endif
+#ifdef CT_HAVE_VULKAN
+  if (p->backend == CT_BACKEND_VULKAN) return CtVkWaitedMs(p->vk);
+#endif
+  return 0;
+}
+
+int CtPresentRenderThread(CtPresenter* p, long* seq, double* work, double* up, double* wait) {
+  if (!p || !p->async || !seq) return -1;
+  long cur = p->rtSeq; if (cur == *seq) return 0;
+  *seq = cur; *work = p->rtWork; *up = p->rtUp; *wait = p->rtWait; return 1;
+}
+void CtPresentRenderThreadTotals(CtPresenter* p, long* shown, long* replaced) { if (shown) *shown = p ? p->rtShownTotal : 0; if (replaced) *replaced = p ? p->rtReplacedTotal : 0; }

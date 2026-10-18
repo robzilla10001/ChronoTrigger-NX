@@ -25,7 +25,7 @@ Put these in a folder of the SD card, e.g. `sdmc:/switch/ChronoTrigger-NX/` (the
 | `ct_assets.dat` | setup |
 | `Chrono_Trigger_USA_SNES.sfc` | setup (your dump, verified; battles and the sound driver read it) |
 
-`ct_sram.srm` (the battery save), `ct_settings.ini`, `ct_log.txt` (stdout/stderr) and `ct_stats.txt` (the per-second performance line) appear in the same folder.
+`ct_sram.srm` (the battery save) and `ct_settings.ini` appear in the same folder, and a `logs/` folder with a NEW log, stats file and benchmark summary for every run, named after the program and the start time (`ct_log_ct_field_mesa_20261018-041530.txt`, ...). See [BENCHMARK.md](BENCHMARK.md).
 Launch from the homebrew menu in **application mode** (hold R on a game) for the full memory and CPU budget; from Sphaira or as a forwarder works too.
 
 ## Controls
@@ -48,9 +48,9 @@ frame for ~3 s after an applet event or a long frame (a load), with the boost-mo
 but does not stick. The original clock is restored at exit. (docs/switch-cpu-boost-prompt.md describes the method.)
 
 `ct_boost.ini` next to the `.nro` (one `key=value` per line): `boost=0` leaves the clock alone (the baseline for a measurement);
-`pin=<0-2>` pins the main thread to that app core; `async=0` turns off the render thread (below). Set **Performance HUD** in the mods menu (Video tab) to **Full HUD** (every counter) or **FPS only** (just the frame rate; **OFF** draws nothing; saved as `stats_hud=full|fps|off`) to see `CPU <n> MHZ`
+`pin=<0-2>` pins the main thread to that app core; `async=0` turns off the render thread (below); `bench=<0..4>` / `bench_secs=<n>` run the benchmarks ([BENCHMARK.md](BENCHMARK.md)). Set **Performance HUD** in the mods menu (Video tab) to **Full HUD** (every counter) or **FPS only** (just the frame rate; **OFF** draws nothing; saved as `stats_hud=full|fps|off`) to see `CPU <n> MHZ`
 live, and the picture's sizes: `RENDER WxH` (the uploaded picture: 256x224 x the internal scale, wider with widescreen) and `SHOWN WxH IN WxH` (the
-rectangle it is drawn in, and the window's output), with the options that make them; `ct_stats.txt` has the full line: `cpu <MHz> bench <us> core<N> [<c0> <c1> <c2>] re=<re-asserts> ev=<applet events> fb=<fallbacks>
+rectangle it is drawn in, and the window's output), with the options that make them; the run's `logs/ct_stats_*.txt` has the full line: `cpu <MHz> bench <us> core<N> [<c0> <c1> <c2>] re=<re-asserts> ev=<applet events> fb=<fallbacks>
 rc=<last result>` (`bench` is a fixed loop: ~610 us boosted, ~1175 us at 1020 MHz).
 
 ## The save/load state menu (ZL + ZR)
@@ -76,7 +76,7 @@ Chosen in the Video tab and applied the next time the game starts (it is saved i
 | Vulkan | `vulkan` | Mesa's NVK driver from [mesa-switch](https://github.com/danfromtico/mesa-switch) (Mesa 26.2.4, MIT), linked into the game with no loader (`src/present_vk.c`: a surface on the console's NWindow through `VK_NN_vi_surface`). Needs the build step below. |
 | deko3d | `deko3d` | The Switch's native graphics API (`src/present_dk.cpp`): the frame is an RGBA texture drawn as one quad; the menus and the HUD draw through a small deko3d renderer of Dear ImGui's draw data. |
 
-Vulkan and deko3d have no screenshots yet. A backend that cannot start falls back to SDL_Renderer with the reason in `ct_log.txt`. A backend that crashes its own start is
+Vulkan and deko3d have no screenshots yet. A backend that cannot start falls back to SDL_Renderer with the reason in the run's log. A backend that crashes its own start is
 caught too: a marker file (`ct_backend_try`) is written before a non-default backend starts and removed after two seconds of frames, and a start that finds it still there goes
 back to SDL_Renderer (and says so in the log). The deko3d shaders are pre-built (`src/dk/dk_shaders.inc`, from the `.glsl` files beside it with `src/dk/build_shaders.sh`).
 
@@ -113,7 +113,7 @@ set `MESA_SWITCH_GL_DRIVER=zink` before the game starts (the default is Mesa's n
 
 ## How the game exits (`ct_boost.ini`, `exit=`)
 
-The default (`exit=0`) is right for both NROs. The setting exists for diagnosis; every step is written to `ct_log.txt` (`exit mode N ...`, `exit: overlay down`, ...).
+The default (`exit=0`) is right for both NROs. The setting exists for diagnosis; every step is written to the run's log (`exit mode N ...`, `exit: overlay down`, ...).
 
 | `exit=` | What happens |
 |---|---|
@@ -129,6 +129,7 @@ process simply ends):
   pool workers, the sound thread and the render thread are all stopped and joined first.
 * **The GPU must be torn down, and its services released.** Skipping the graphics teardown (`exit=1`) leaves GPU mappings the loader cannot unmap on the Mesa 26 build; after a full
   teardown the loader's next program (Sphaira) failed with `2001-0132`, out of resource, until the exit also closed any nvdrv sessions the runtime left open (`CtSwitchReleaseGpu`).
+* **Every file we open must be closed.** The run's log was left open once; the loader's process kept that file-system session for the next launch and ran out (`2001-0132`) after 4 to 19 chained launches. The log is closed at exit now ([BENCHMARK.md](BENCHMARK.md#the-processs-kernel-resources)).
 * `svcExitProcess` (`exit=2`, `3`) skips the applet's own clean exit and ends in the system's error dialog.
 
 ## The render thread
@@ -146,7 +147,7 @@ thread's time in the hand-off (~0); `rt <work>/<wait> (up <upload>)` is the thre
 
 ## The spike log
 
-Any frame over 40 ms appends one line to `ct_stats.txt` (and the log): `SPIKE <t>s <mode> loc <id> work <ms> | logic .. (vm .. battle .. load ..) compose ..
+Any frame over 40 ms appends one line to the run's stats file (and the log): `SPIKE <t>s <mode> loc <id> work <ms> | logic .. (vm .. battle .. load ..) compose ..
 (base fx wide cmb hud asm) picture .. title .. audio .. convert .. swap ..` -- where the frame's time went (vm = the event VM, battle = the battle
 module's tick, load = a location load).
 

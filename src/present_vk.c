@@ -38,7 +38,8 @@ extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
   X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateImage) \
   X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCmdPipelineBarrier) \
   X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdClearColorImage) \
-  X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool)
+  X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
+  X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 #define DECL(f) static PFN_##f f;
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
 static PFN_vkCreateInstance vkCreateInstance;
@@ -46,6 +47,7 @@ VK_FUNCS_INSTANCE(DECL)
 VK_FUNCS_DEVICE(DECL)
 #undef DECL
 
+static double nowMsVk(void) { return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency(); }
 // The size of the surface's window in pixels: SDL's Vulkan drawable on the PC, the window on the Switch.
 static void winSize(SDL_Window* w, int* ww, int* hh) {
 #ifdef __SWITCH__
@@ -69,6 +71,7 @@ struct CtVk {
   VkBuffer rb; VkDeviceMemory rbMem; void* rbMap; VkDeviceSize rbSize;   // the probe's readback
   VkDescriptorPool dpool;
   uint32_t cur; int acquired, recording, needRecreate;
+  VkQueryPool qp; double tsPeriod; int qArmed; double lastGpuMs, waitedMs; long gpuSeq;      // GPU timestamps: top and bottom of the frame's commands
   char name[160];
 };
 
@@ -289,6 +292,10 @@ int CtVkStart(SDL_Window* win, int vsync, int picW, int picH, CtVk** out) {
     VkDescriptorPoolCreateInfo pi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; pi.maxSets = 16; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(v->dev, &pi, NULL, &v->dpool) != VK_SUCCESS) goto fail; }
+  { VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(v->phys, &pp);   // GPU timestamps, when the queue has them
+    if (pp.limits.timestampComputeAndGraphics && pp.limits.timestampPeriod > 0) {
+      VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO }; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2;
+      if (vkCreateQueryPool(v->dev, &qi, NULL, &v->qp) == VK_SUCCESS) v->tsPeriod = pp.limits.timestampPeriod; else v->qp = VK_NULL_HANDLE; } }
   if (!swapCreate(v)) { fprintf(stderr, "[video] Vulkan: no swapchain\n"); goto fail; }
   *out = v;
   return 1;
@@ -304,6 +311,7 @@ void CtVkStop(CtVk* v) {
     swapDestroy(v);
     if (v->swap) vkDestroySwapchainKHR(v->dev, v->swap, NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev, v->dpool, NULL);
+    if (v->qp) vkDestroyQueryPool(v->dev, v->qp, NULL);
     if (v->rb) { vkDestroyBuffer(v->dev, v->rb, NULL); vkFreeMemory(v->dev, v->rbMem, NULL); }
     picDestroy(v);
     if (v->fence) vkDestroyFence(v->dev, v->fence, NULL);
@@ -319,6 +327,8 @@ void CtVkStop(CtVk* v) {
 
 const char* CtVkName(const CtVk* v) { return v ? v->name : ""; }
 void CtVkOutputSize(CtVk* v, int* w, int* h) { if (v->ext.width && v->ext.height) { *w = (int)v->ext.width; *h = (int)v->ext.height; } else winSize(v->win, w, h); }
+double CtVkGpuMs(CtVk* v, long* seq) { if (seq) *seq = v->gpuSeq; return v->lastGpuMs; }
+double CtVkWaitedMs(CtVk* v) { return v->waitedMs; }
 void CtVkSetVsync(CtVk* v, int on) { if (v->vsync != (on != 0)) { v->vsync = on != 0; v->needRecreate = 1; } }
 
 void CtVkUpload(CtVk* v, const uint8_t* rgb) {
@@ -335,12 +345,19 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
   if (!v->acquired) {
     if (v->needRecreate || v->ext.width != (uint32_t)w || v->ext.height != (uint32_t)h || !v->swap)
       if (!swapRecreate(v)) { v->recording = 0; return; }
+    double w0 = nowMsVk();
     vkWaitForFences(v->dev, 1, &v->fence, VK_TRUE, UINT64_MAX);
+    if (v->qArmed && v->qp) {                                      // the last frame is done: the GPU's own clock says how long it took
+      uint64_t ts[2];
+      if (vkGetQueryPoolResults(v->dev, v->qp, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0]) {
+        v->lastGpuMs = (double)(ts[1] - ts[0]) * v->tsPeriod / 1e6; v->gpuSeq++; }
+      v->qArmed = 0; }
     VkResult r = vkAcquireNextImageKHR(v->dev, v->swap, UINT64_MAX, v->avail, VK_NULL_HANDLE, &v->cur);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
       if (!swapRecreate(v)) { v->recording = 0; return; }
       r = vkAcquireNextImageKHR(v->dev, v->swap, UINT64_MAX, v->avail, VK_NULL_HANDLE, &v->cur);
     }
+    v->waitedMs += nowMsVk() - w0;
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { v->recording = 0; return; }
     v->acquired = 1;
   }
@@ -348,6 +365,7 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
   vkResetCommandBuffer(c, 0);
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(c, &bi);
+  if (v->qp) { vkCmdResetQueryPool(c, v->qp, 0, 2); vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, v->qp, 0); }
   if (v->upload || v->picLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
     barrier(c, v->pic, v->picLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -393,6 +411,7 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
 static int finish(CtVk* v, int readback) {
   VkCommandBuffer c = v->cmd;
   vkCmdEndRenderPass(c);                                           // -> PRESENT_SRC
+  if (v->qp) { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, v->qp, 1); v->qArmed = 1; }
   int rbOk = 0;
   if (readback && (v->swapUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
     VkDeviceSize need = (VkDeviceSize)v->ext.width * v->ext.height * 4;

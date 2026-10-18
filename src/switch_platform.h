@@ -47,6 +47,11 @@ int  CtSwitchBackendTryPending(void);
 // The dummy-driver backends (deko3d, Vulkan) could not start: save SDL_Renderer as the choice and relaunch the game (through the homebrew loader), which
 // is a clean start on the console's video driver. Does not return.
 void CtSwitchBackendFailed(void);
+void CtSwitchBoostIniSet(const char* key, const char* val);   // rewrite one line of ct_boost.ini
+int  CtSwitchLeakStage(void);                      // ct_boost.ini leaktest=<0..3>: -1 off; the launch is logged
+void CtSwitchLeakNext(void);                       // the launch is done: relaunch for the next one (or the end)
+void CtSwitchLogResources(const char* tag);       // the process's kernel resource use, in the log
+const char* CtSwitchSelfPath(void);               // the program's own path as launched, for the relaunches
 #else
 #define CtSwitchInit(argc, argv) ((void)0)
 #define CtSwitchTrace(what) ((void)0)
@@ -69,5 +74,10 @@ void CtSwitchBackendFailed(void);
 #define CtSwitchBackendTryEnd() ((void)0)
 #define CtSwitchBackendTryPending() 0
 #define CtSwitchBackendFailed() ((void)0)
+#define CtSwitchSelfPath() ""
+#define CtSwitchLogResources(t) ((void)0)
+#define CtSwitchLeakStage() (-1)
+#define CtSwitchLeakNext() ((void)0)
+#define CtSwitchBoostIniSet(k, v) ((void)0)
 #endif
 #endif

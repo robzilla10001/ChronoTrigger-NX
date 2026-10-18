@@ -133,3 +133,5 @@ tools/_*
 /src/ct_world.c
 /src/overlay_stub.c
 /src/viewer.c
+/logs/
+ct_bench_state

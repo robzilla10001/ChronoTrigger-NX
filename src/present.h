@@ -34,6 +34,11 @@ typedef struct CtPresentConfig {
 } CtPresentConfig;
 
 CtPresenter*  CtPresentCreate(const CtPresentConfig* cfg);
+int           CtPresentGpuMs(CtPresenter* p, long* seq, double* ms);   // 1 = a new GPU frame time (by the GPU's own timestamps) since *seq, 0 = none yet, -1 = this backend has none
+double        CtPresentWaitedMs(CtPresenter* p);                       // ms the CPU has spent blocked on the GPU so far (Vulkan, deko3d)
+int           CtPresentBackendAvailable(int id);                      // 1 = this build has that backend (CT_BACKEND_*)
+int           CtPresentBackendId(const CtPresenter* p);               // the backend actually running (a failed start falls back to SDL)
+void          CtPresentBench(CtPresenter* p);                         // the presentation micro-benchmark (bench.h): rows to the log and logs/bench_present.csv
 void          CtPresentDestroy(CtPresenter* p);
 SDL_Window*   CtPresentWindow(CtPresenter* p);
 const char*   CtPresentName(const CtPresenter* p);        // e.g. "OpenGL 3.3 (NVIDIA ...)" / "SDL direct3d11"

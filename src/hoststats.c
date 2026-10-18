@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "switch_platform.h"
 #include "settings.h"
+#include "bench.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -11,6 +12,7 @@ static Acc  g_part[CT_ST_N], g_work, g_slept;
 static long g_frames, g_over, g_hitch, g_skips, g_aud, g_audDrop, g_audZero, g_presents;
 static unsigned g_audMin = 0xFFFFFFFFu, g_audMax;
 static double g_runT0 = -1.0;
+static double g_periodSum; static long g_periodN;
 static double g_winT0 = -1.0, g_prevEnd = -1.0, g_period, g_periodMax;
 static double g_fp[CT_ST_N];                      // this frame's own part times (for the spike log)
 static int g_shownExt;                           // a render thread counts the frames it shows (CtStatsShownFrames)
@@ -28,7 +30,7 @@ double CtStatsNow(void) { return nowMs(); }
 // ON = the counters run (and log): the Switch build always (ct_stats.txt), elsewhere CT_STATS=1, and anywhere the player turns the
 // HUD on in the options overlay (the counters cost a few clock reads a frame). The HUD drawing itself is the setting's alone.
 static int statsEnv(void);
-int CtStatsOn(void) { return statsEnv() || CtSettingsGet()->statsHud != CT_HUD_OFF; }
+int CtStatsOn(void) { return statsEnv() || CtSettingsGet()->statsHud != CT_HUD_OFF || CtBenchMode() != 0; }
 static int statsEnv(void) {
   static int on = -1;
   if (on < 0) {
@@ -58,6 +60,13 @@ void CtStatsMark(int which) {
   g_mark[which] = nowMs();
   if (which == 0) g_lapT = g_mark[0];
 }
+void CtStatsReset(void) {
+  for (int i = 0; i < CT_ST_N; i++) { g_part[i] = (Acc){0}; g_fp[i] = 0; }
+  g_work = (Acc){0}; g_slept = (Acc){0};
+  g_frames = g_over = g_hitch = g_skips = g_presents = g_aud = g_audDrop = g_audZero = 0;
+  g_audMin = 0xFFFFFFFFu; g_audMax = 0; g_periodMax = 0; g_period = 0; g_periodSum = 0; g_periodN = 0;
+  g_mark[0] = g_mark[1] = -1.0; g_lapT = -1.0; g_winT0 = g_runT0 = -1.0; g_prevEnd = -1.0;                  // (the next frame starts the window and the run clock again)
+}
 void CtStatsClockReset(void) { g_prevEnd = nowMs(); g_mark[0] = g_mark[1] = -1.0; g_lapT = -1.0; for (int i = 0; i < CT_ST_N; i++) g_fp[i] = 0; }
 void CtStatsLap(int part) {
   if (!CtStatsOn() || g_lapT < 0) return;
@@ -71,6 +80,10 @@ void CtStatsAudio(unsigned q, int dropped) {
   if (q < g_audMin) g_audMin = q;
   if (q > g_audMax) g_audMax = q;
 }
+
+#ifdef __SWITCH__
+static const char* statsPath(void) { static char p[256]; if (!p[0]) CtRunPath(p, sizeof p, "ct_stats", "txt"); return p; }   // one file per run, named after the program and the start time
+#endif
 
 static void roll(double now) {
   double secs = (now - g_winT0) / 1000.0;
@@ -102,7 +115,7 @@ static void roll(double now) {
   fflush(stderr);
 #ifdef __SWITCH__
   { // its own file, opened and closed each second: it does not depend on how stdout/stderr were redirected
-    FILE* sf = fopen("ct_stats.txt", "a");
+    FILE* sf = fopen(statsPath(), "a");
     if (sf) {
       fprintf(sf, "%.0f s: render %dx%d shown %dx%d | %s | %s loc %03X logic %.2f compose %.2f | engine %.1f shown %.1f | frame avg %.2f max %.1f | work avg %.2f max %.1f slept %.2f | "
               "x vm %.2f bat %.2f load %.2f enter %.2f bake %.2f bake3 %.2f layers %.2f sndload %.2f bakepct %.0f arena %.2f fx %.2f laps base %.2f fx %.2f wide %.2f cmb %.2f hud %.2f asm %.2f rt %.2f/%.2f (up %.2f) audio %.2f picture %.2f title %.2f upload %.2f draw %.2f swap %.2f (max %.1f) ajoin %.2f misc %.2f tirender %.2f tiup %.2f timode %.2f | over16.7 %ld over33 %ld skips %ld | audio q %u..%u drop %ld empty %ld\n",
@@ -113,6 +126,11 @@ static void roll(double now) {
     }
   }
 #endif
+#ifdef __SWITCH__
+  CtBenchSecond(g_mode, g_loc, fps, pfps, g_period, g_periodMax, avg(&g_work), CtSwitchCpuMHz(), CtSwitchGpuMHz(), CtSwitchMemMHz(), g_audDrop, g_audZero);
+#else
+  CtBenchSecond(g_mode, g_loc, fps, pfps, g_period, g_periodMax, avg(&g_work), 0, 0, 0, g_audDrop, g_audZero);
+#endif
   for (int i = 0; i < CT_ST_N; i++) g_part[i] = (Acc){0};
   g_work = (Acc){0}; g_slept = (Acc){0};
   g_frames = g_over = g_hitch = g_skips = g_presents = g_aud = g_audDrop = g_audZero = 0;
@@ -120,7 +138,6 @@ static void roll(double now) {
   g_winT0 = now;
 }
 
-static double g_periodSum; static long g_periodN;
 void CtStatsFrame(double workMs, double sleptMs) {
   if (!CtStatsOn()) return;
   double now = nowMs();
@@ -141,12 +158,13 @@ void CtStatsFrame(double workMs, double sleptMs) {
              g_fp[CT_ST_PICTURE], g_fp[CT_ST_TITLE], g_fp[CT_ST_AUDIO], g_fp[CT_ST_UPLOAD], g_fp[CT_ST_SWAP], g_fp[CT_ST_XJOIN], g_fp[CT_ST_XMISC]);
     fprintf(stderr, "[stats] %s\n", b); fflush(stderr);
 #ifdef __SWITCH__
-    { FILE* sf = fopen("ct_stats.txt", "a"); if (sf) { fprintf(sf, "%s\n", b); fclose(sf); } }
+    { FILE* sf = fopen(statsPath(), "a"); if (sf) { fprintf(sf, "%s\n", b); fclose(sf); } }
 #endif
   }
+  double per = now - g_prevEnd; g_prevEnd = now;
+  CtBenchFrame(g_mode, per, workMs, g_fp[CT_ST_UPLOAD], g_fp[CT_ST_DRAW], g_fp[CT_ST_SWAP], g_fp[CT_ST_LOGIC], g_fp[CT_ST_COMPOSE], g_fp[CT_ST_LHUD], g_fp[CT_ST_RWORK], g_fp[CT_ST_RUP], g_fp[CT_ST_RWAIT]);
   for (int i = 0; i < CT_ST_N; i++) g_fp[i] = 0;
   g_mark[0] = g_mark[1] = -1;
-  double per = now - g_prevEnd; g_prevEnd = now;
   g_periodSum += per; g_periodN++;
   if (per > g_periodMax) g_periodMax = per;
   if (now - g_winT0 >= 1000.0) {
@@ -155,7 +173,10 @@ void CtStatsFrame(double workMs, double sleptMs) {
   }
 }
 
+static const char* const* g_forceLines; static int g_forceN;
+void CtStatsHudForce(const char* const* lines, int n) { g_forceLines = lines; g_forceN = lines ? n : 0; }
 const char* const* CtStatsHud(int* n) {
+  if (g_forceLines && g_forceN > 0) { if (n) *n = g_forceN; return g_forceLines; }
   const int mode = CtSettingsGet()->statsHud;
   if (mode == CT_HUD_OFF || !g_hudN) { if (n) *n = 0; return NULL; }
   if (mode == CT_HUD_FPS) {                           // the frame rate alone: the pictures shown a second

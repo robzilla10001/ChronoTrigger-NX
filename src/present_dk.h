@@ -12,6 +12,8 @@ typedef struct CtDk CtDk;
 int         CtDkStart(SDL_Window* win, int vsync, int picW, int picH, CtDk** out);   // 1 = running
 void        CtDkStop(CtDk* d);
 const char* CtDkName(const CtDk* d);
+double      CtDkGpuMs(CtDk* d, long* seq);                // the GPU time (ms) of the last finished frame, by the GPU's own timestamps; *seq counts new ones
+double      CtDkWaitedMs(CtDk* d);                        // ms the CPU has spent blocked on the GPU (fences) so far
 void        CtDkOutputSize(CtDk* d, int* w, int* h);
 void        CtDkSetVsync(CtDk* d, int on);
 void        CtDkUpload(CtDk* d, const uint8_t* rgb24);
