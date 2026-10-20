@@ -6,7 +6,8 @@
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"; cd "$HERE"
 if [ -z "$SKIP_MESA" ]; then sh switch/get_mesa.sh; sh switch/get_mesa_unified.sh; fi
-tar -cf - src switch third_party/mesa-switch third_party/mesa-switch-unified third_party/imgui snes | docker exec -i switch_dev_build tar -xf - -C /src
+[ -f third_party/slang-switch/lib/libglslang.a ] || sh switch/get_slang.sh        # (the slang shader support: glslang + SPIRV-Cross, ~12 MB)
+tar -cf - src switch third_party/mesa-switch third_party/mesa-switch-unified third_party/imgui third_party/slang-switch snes | docker exec -i switch_dev_build tar -xf - -C /src
 docker exec switch_dev_build bash -c 'export DEVKITPRO=/opt/devkitpro; cd /src
   cmake -S switch -B bs -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake >/dev/null && cmake --build bs -j8
   cmake -S switch -B bs-mesa -DCT_MESA_UNIFIED=ON -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake >/dev/null && cmake --build bs-mesa -j8'

@@ -18,6 +18,10 @@
 extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);   // (libvulkan.a)
 #endif
 #include "present_vk.h"
+#ifdef CT_HAVE_SLANG
+#include "slang/slang_vk.h"
+#include "slang/slang_chain.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +42,7 @@ extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
   X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateImage) \
   X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCmdPipelineBarrier) \
   X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdClearColorImage) \
-  X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
+  X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 #define DECL(f) static PFN_##f f;
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
@@ -58,6 +62,9 @@ static void winSize(SDL_Window* w, int* ww, int* hh) {
 #endif
 }
 
+#ifdef CT_HAVE_SLANG
+struct SlState; static void slStop(struct CtVk* v);
+#endif
 #define MAXIMG 8
 struct CtVk {
   SDL_Window* win;
@@ -67,7 +74,8 @@ struct CtVk {
   VkImage img[MAXIMG]; VkImageView view[MAXIMG]; VkFramebuffer fb[MAXIMG]; VkSemaphore done[MAXIMG];
   VkRenderPass pass; VkCommandPool pool; VkCommandBuffer cmd; VkSemaphore avail; VkFence fence;
   VkBuffer stage; VkDeviceMemory stageMem; void* stageMap;
-  VkImage pic; VkDeviceMemory picMem; VkImageLayout picLayout; int upload;
+  VkImage pic; VkDeviceMemory picMem; VkImageView picView; VkImageLayout picLayout; int upload;
+  struct SlState* sl;                                   // the slang shader chain (slang_vk.h), created on the first CtVkShaderSet
   VkBuffer rb; VkDeviceMemory rbMem; void* rbMap; VkDeviceSize rbSize;   // the probe's readback
   VkDescriptorPool dpool;
   uint32_t cur; int acquired, recording, needRecreate;
@@ -104,21 +112,25 @@ static void barrier(VkCommandBuffer c, VkImage im, VkImageLayout from, VkImageLa
 // the picture: the staging buffer the frame is written to and the image the blit reads
 static void picDestroy(CtVk* v) {
   if (v->stage) { vkDestroyBuffer(v->dev, v->stage, NULL); vkFreeMemory(v->dev, v->stageMem, NULL); }
+  if (v->picView) vkDestroyImageView(v->dev, v->picView, NULL);
   if (v->pic) { vkDestroyImage(v->dev, v->pic, NULL); vkFreeMemory(v->dev, v->picMem, NULL); }
-  v->stage = VK_NULL_HANDLE; v->stageMem = VK_NULL_HANDLE; v->stageMap = NULL; v->pic = VK_NULL_HANDLE; v->picMem = VK_NULL_HANDLE;
+  v->picView = VK_NULL_HANDLE; v->stage = VK_NULL_HANDLE; v->stageMem = VK_NULL_HANDLE; v->stageMap = NULL; v->pic = VK_NULL_HANDLE; v->picMem = VK_NULL_HANDLE;
 }
 static int picCreate(CtVk* v, int picW, int picH) {
   if (!makeBuffer(v, (VkDeviceSize)picW * picH * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &v->stage, &v->stageMem, &v->stageMap)) return 0;
   VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
   ic.imageType = VK_IMAGE_TYPE_2D; ic.format = VK_FORMAT_R8G8B8A8_UNORM; ic.extent.width = (uint32_t)picW; ic.extent.height = (uint32_t)picH;
   ic.extent.depth = 1; ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ic.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  ic.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(v->dev, &ic, NULL, &v->pic) != VK_SUCCESS) return 0;
   VkMemoryRequirements mr; vkGetImageMemoryRequirements(v->dev, v->pic, &mr);
   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO }; ai.allocationSize = mr.size;
   ai.memoryTypeIndex = memType(v, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(v->dev, &ai, NULL, &v->picMem) != VK_SUCCESS) return 0;
   vkBindImageMemory(v->dev, v->pic, v->picMem, 0);
+  { VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO }; vi.image = v->pic; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+    vkCreateImageView(v->dev, &vi, NULL, &v->picView); }                                          // (the slang chain samples it)
   v->picLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   v->picW = picW; v->picH = picH;
   memset(v->stageMap, 0, (size_t)picW * picH * 4); v->upload = 1;
@@ -308,6 +320,9 @@ void CtVkStop(CtVk* v) {
   if (!v) return;
   if (v->dev) {
     vkDeviceWaitIdle(v->dev);
+#ifdef CT_HAVE_SLANG
+    slStop(v);
+#endif
     swapDestroy(v);
     if (v->swap) vkDestroySwapchainKHR(v->dev, v->swap, NULL);
     if (v->dpool) vkDestroyDescriptorPool(v->dev, v->dpool, NULL);
@@ -337,6 +352,79 @@ void CtVkUpload(CtVk* v, const uint8_t* rgb) {
   v->upload = 1;
 }
 
+
+// ---- the slang shader chain (src/slang/slang_vk.c): a preset's passes between the picture's upload and the overlay -----------------------------------------------------------------------------
+#ifdef CT_HAVE_SLANG
+struct SlState {
+  CtSlChain* chain; CtSlGpuOps ops; void* dev; void* orig;
+  char status[600]; char path[256]; int pending, failed; unsigned long long frame;
+};
+static int slBeginFinal(void* user, const CtSlRect* vp) {         // the last pass: the backbuffer for drawing, the host's pass begun on it, the viewport on the picture's rectangle
+  CtVk* v = (CtVk*)user; VkCommandBuffer c = v->cmd; VkImage im = v->img[v->cur];
+  barrier(c, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+  VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO }; rp.renderPass = v->pass; rp.framebuffer = v->fb[v->cur]; rp.renderArea.extent = v->ext;
+  vkCmdBeginRenderPass(c, &rp, VK_SUBPASS_CONTENTS_INLINE);
+  VkViewport vw = { (float)vp->x, (float)vp->y, (float)vp->w, (float)vp->h, 0.0f, 1.0f }; VkRect2D sc = { { vp->x, vp->y }, { (uint32_t)vp->w, (uint32_t)vp->h } };
+  vkCmdSetViewport(c, 0, 1, &vw); vkCmdSetScissor(c, 0, 1, &sc);
+  v->recording = 1;
+  return 0;
+}
+static void slStop(CtVk* v) {                                      // (the device is idle or the frame is not in flight)
+  if (!v->sl) return;
+  if (v->sl->chain) { CtSlChainFree(v->sl->chain); v->sl->chain = NULL; }
+  if (v->sl->orig) { CtSlVkWrapFree(v->sl->orig); v->sl->orig = NULL; }
+  if (v->sl->dev) { CtSlVkDestroy(v->sl->dev); v->sl->dev = NULL; }
+  free(v->sl); v->sl = NULL;
+}
+// A requested preset is (re)loaded at the start of a frame, after the fence wait (nothing of ours is in flight) and before the commands are recorded.
+static void slApply(CtVk* v) {
+  struct SlState* s = v->sl; s->pending = 0; s->failed = 0; s->status[0] = 0;
+  if (s->chain) { vkDeviceWaitIdle(v->dev); CtSlChainFree(s->chain); s->chain = NULL; }
+  if (!s->path[0]) return;
+  char err[2048];
+  if (!s->dev) {
+    CtSlVkEnv env = { (PFN_vkGetInstanceProcAddr)vkGetInstanceProcAddr_, v->inst, v->phys, v->dev, v->queue, v->qfam, v->pass, slBeginFinal, v };
+    if (CtSlVkCreate(&env, &s->ops, &s->dev, err, sizeof err)) { snprintf(s->status, sizeof s->status, "%s", err); return; }
+    s->orig = CtSlVkWrap(s->dev, v->pic, v->picView, v->picW, v->picH);
+  }
+  double t0 = nowMsVk();
+  CtSlChain* c = CtSlChainLoad(s->path, &s->ops, s->dev, NULL, NULL, err, sizeof err);
+  if (!c) { snprintf(s->status, sizeof s->status, "%s", err); fprintf(stderr, "[slang] %s: %s\n", s->path, err); fflush(stderr); return; }
+  s->chain = c; s->frame = 0; v->upload = 1;
+  snprintf(s->status, sizeof s->status, "%s: %d passes, %d parameters, loaded in %.1f s%s%s", s->path, CtSlChainPasses(c), CtSlChainParamCount(c), (nowMsVk() - t0) / 1000.0,
+           CtSlChainWarnings(c)[0] ? "; warnings: " : "", CtSlChainWarnings(c));
+  fprintf(stderr, "[slang] %s\n", s->status); fflush(stderr);
+}
+// Run the chain into the rectangle `d`. 1 = it drew (the host's pass is open); 0 = it did not start (draw the plain picture).
+static int slRun(CtVk* v, SDL_Rect d, int linear) {
+  struct SlState* s = v->sl;
+  CtSlVkWrapSet(s->orig, v->pic, v->picView, v->picW, v->picH);
+  CtSlFrame fr = { s->orig, v->picW, v->picH, s->frame++, { d.x, d.y, d.w, d.h }, linear, 60.0f, d.h > 0 ? (float)d.w / (float)d.h : 0.0f };
+  CtSlVkBeginFrame(s->dev, v->cmd);
+  if (CtSlChainRun(s->chain, &fr)) {
+    s->failed = 1; snprintf(s->status, sizeof s->status, "the shader chain failed to run; drawing the plain picture");
+    return v->recording;                                           // (if its last pass already opened the host's pass, the frame goes on in it)
+  }
+  return 1;
+}
+int CtVkShaderSet(CtVk* v, const char* path) {
+  if (!v) return 0;
+  if (!v->sl) { if (!path || !*path) return 0; v->sl = (struct SlState*)calloc(1, sizeof *v->sl); if (!v->sl) return 0; }
+  snprintf(v->sl->path, sizeof v->sl->path, "%s", path ? path : ""); v->sl->pending = 1;
+  snprintf(v->sl->status, sizeof v->sl->status, "%s", path && *path ? "loading..." : "");
+  return 1;
+}
+const char* CtVkShaderStatus(CtVk* v) { return v && v->sl ? v->sl->status : ""; }
+void* CtVkShaderChain(CtVk* v) { return v && v->sl ? (void*)v->sl->chain : NULL; }
+int CtVkShaderWanted(CtVk* v) { return v && v->sl && v->sl->path[0] && !v->sl->failed; }
+#else
+int CtVkShaderSet(CtVk* v, const char* path) { (void)v; (void)path; return 0; }
+const char* CtVkShaderStatus(CtVk* v) { (void)v; return "this build has no slang shader support"; }
+void* CtVkShaderChain(CtVk* v) { (void)v; return NULL; }
+int CtVkShaderWanted(CtVk* v) { (void)v; return 0; }
+#endif
+
 // The frame up to the overlay: acquire, upload, clear, blit, open the pass. Drawing again before the swap re-records
 // the same acquired image (the overlay probe draws three times).
 void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
@@ -361,6 +449,16 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { v->recording = 0; return; }
     v->acquired = 1;
   }
+#ifdef CT_HAVE_SLANG
+  if (v->sl && v->sl->pending) slApply(v);
+  int chainOn = v->sl && v->sl->chain && !v->sl->failed;
+  if (chainOn && CtSlChainCapturePending(v->sl->chain)) {                    // a capture of every pass was asked for: now, before this frame is recorded (the GPU is idle, the picture is the last frame's)
+    CtSlVkWrapSet(v->sl->orig, v->pic, v->picView, v->picW, v->picH);
+    CtSlChainCaptureAuto(v->sl->chain);
+  }
+#else
+  const int chainOn = 0;
+#endif
   VkCommandBuffer c = v->cmd;
   vkResetCommandBuffer(c, 0);
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -376,6 +474,8 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     v->picLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; v->upload = 0;
   }
+  { VkImageLayout want = chainOn ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;   // the blit reads it as a transfer source, the shader chain samples it
+    if (v->picLayout != want) { barrier(c, v->pic, v->picLayout, want, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); v->picLayout = want; } }
   VkImage im = v->img[v->cur];
   barrier(c, im, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -386,7 +486,11 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
   if (d.x < 0) { d.w += d.x; d.x = 0; } if (d.y < 0) { d.h += d.y; d.y = 0; }
   if (d.x + d.w > (int)v->ext.width) d.w = (int)v->ext.width - d.x;
   if (d.y + d.h > (int)v->ext.height) d.h = (int)v->ext.height - d.y;
-  if (d.w > 0 && d.h > 0) {
+  int chained = 0;
+#ifdef CT_HAVE_SLANG
+  if (chainOn && d.w > 0 && d.h > 0) chained = slRun(v, d, linear);
+#endif
+  if (!chained && d.w > 0 && d.h > 0) {
     VkImageBlit b = { 0 };
     b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1;
     b.srcOffsets[1].x = v->picW; b.srcOffsets[1].y = v->picH; b.srcOffsets[1].z = 1;
@@ -397,12 +501,14 @@ void CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear) {
     vkCmdBlitImage(c, v->pic, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
                    linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
   }
-  barrier(c, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-  VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-  rp.renderPass = v->pass; rp.framebuffer = v->fb[v->cur]; rp.renderArea.extent = v->ext;
-  vkCmdBeginRenderPass(c, &rp, VK_SUBPASS_CONTENTS_INLINE);
+  if (!chained) {
+    barrier(c, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = v->pass; rp.framebuffer = v->fb[v->cur]; rp.renderArea.extent = v->ext;
+    vkCmdBeginRenderPass(c, &rp, VK_SUBPASS_CONTENTS_INLINE);
+  }
   v->recording = 1;
 }
 

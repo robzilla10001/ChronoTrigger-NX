@@ -62,6 +62,11 @@ void          CtPresentSync(CtPresenter* p);                          // wait un
 void          CtPresentStopThread(CtPresenter* p);                    // end and join the render thread (at exit; the presenter itself stays)
 
 void          CtPresentSetVsync(CtPresenter* p, int on);
+// SLANG SHADERS (src/slang, docs/SLANG.md): a RetroArch .slangp preset run over the picture on the GPU. "" / NULL turns it off. 1 = running; 0 = off or could not start (the reason is in
+// CtPresentShaderStatus, one line for the menu: "<preset>: <n> passes" or the error). Backends with no shader runner yet say so there and draw the picture as usual.
+int           CtPresentShaderSet(CtPresenter* p, const char* presetPath);
+const char*   CtPresentShaderStatus(CtPresenter* p);
+void*         CtPresentShaderChain(CtPresenter* p);                   // the loaded CtSlChain* (slang_chain.h: its parameters), or NULL
 void          CtPresentPicSize(CtPresenter* p, int* w, int* h);       // the uploaded picture's size: what is RENDERED
 void          CtPresentOutputSize(CtPresenter* p, int* w, int* h);    // the drawable, in pixels
 int           CtPresentSaveBMP(CtPresenter* p, const char* path);     // what was drawn since the last swap; 1 = saved

@@ -21,7 +21,7 @@ const char* CtSettingsButtonName(int btn) { return (btn >= 0 && btn < CT_BTN_COU
 void CtSettingsDefaults(CtSettings* s) {
   memset(s, 0, sizeof *s);
   s->fullscreen = 0; s->windowScale = 2; s->scaleMode = CT_SCALE_FIT; s->aspect = CT_ASPECT_PIXEL;
-  s->linearFilter = 0; s->renderScale = 1; s->vsync = 1; s->renderDriver[0] = 0; s->backend = 0;
+  s->linearFilter = 0; s->renderScale = 1; s->vsync = 1; s->renderDriver[0] = 0; s->shader[0] = 0; s->backend = 0;
   s->wideRoomWrap = 1;
   s->volume = 100; s->mute = 0;
   // the keyboard ct_field always had (field.c fieldKeyPad): the arrows; A = Z, B = X, X = A, Y = S, L = D, R = C,
@@ -95,6 +95,7 @@ static void setKey(CtSettings* s, const char* sec, const char* key, const char* 
     else if (!strcmp(key, "stats_hud")) s->statsHud = !strcmp(val, "full") ? CT_HUD_FULL : !strcmp(val, "fps") ? CT_HUD_FPS :
                                                        !strcmp(val, "off") ? CT_HUD_OFF : (iv != 0 ? CT_HUD_FULL : CT_HUD_OFF);   // (a number: the old on/off file = full)
     else if (!strcmp(key, "render_driver")) snprintf(s->renderDriver, sizeof s->renderDriver, "%s", val);
+    else if (!strcmp(key, "shader")) snprintf(s->shader, sizeof s->shader, "%s", val);
     else if (!strcmp(key, "backend")) s->backend = !strcmp(val, "opengl") ? 1 : !strcmp(val, "vulkan") ? 2 : !strcmp(val, "deko3d") ? 3 : 0;
   } else if (!strcmp(sec, "sound")) {
     if (!strcmp(key, "volume")) s->volume = clampi(iv, 0, 100);
@@ -145,13 +146,13 @@ int CtSettingsSave(void) {
   FILE* f = fopen(CtSettingsPath(), "w");
   if (!f) return 0;
   fprintf(f, "; Chrono Trigger (native port) -- options. Edited by the F1 overlay; safe to edit by hand.\n\n");
-  fprintf(f, "[video]\nbackend=%s\nfullscreen=%d\nwindow_scale=%d\nscale=%s\naspect=%s\nfilter=%s\nwidescreen=%s\nwide_room_wrap=%d\nrender_scale=%d\ninterpolation=%d\nvsync=%d\nrender_driver=%s\nstats_hud=%s\nclocks=%s\n\n",
+  fprintf(f, "[video]\nbackend=%s\nfullscreen=%d\nwindow_scale=%d\nscale=%s\naspect=%s\nfilter=%s\nwidescreen=%s\nwide_room_wrap=%d\nrender_scale=%d\ninterpolation=%d\nvsync=%d\nrender_driver=%s\nshader=%s\nstats_hud=%s\nclocks=%s\n\n",
           s->backend == 1 ? "opengl" : s->backend == 2 ? "vulkan" : s->backend == 3 ? "deko3d" : "sdl", s->fullscreen, s->windowScale,
           s->scaleMode == CT_SCALE_INTEGER ? "integer" : s->scaleMode == CT_SCALE_STRETCH ? "stretch" : "fit",
           s->aspect == CT_ASPECT_4_3 ? "4:3" : "pixel", s->linearFilter ? "linear" : "nearest",
           s->widescreen == CT_WIDE_16_9 ? "16:9" : s->widescreen == CT_WIDE_16_10 ? "16:10" : s->widescreen == CT_WIDE_21_9 ? "21:9" : "off",
           s->wideRoomWrap, s->renderScale, s->interpolate, s->vsync,
-          s->renderDriver, s->statsHud == CT_HUD_FULL ? "full" : s->statsHud == CT_HUD_FPS ? "fps" : "off",
+          s->renderDriver, s->shader, s->statsHud == CT_HUD_FULL ? "full" : s->statsHud == CT_HUD_FPS ? "fps" : "off",
           s->clocks == CT_CLK_BASE ? "base" : s->clocks == CT_CLK_ERISTA ? "erista" : s->clocks == CT_CLK_MARIKO ? "mariko" : s->clocks == CT_CLK_MAX ? "max" : "auto");
   fprintf(f, "[sound]\nvolume=%d\nmute=%d\n\n", s->volume, s->mute);
   fprintf(f, "[controls]\npad_stick=%d\n", s->padStick);

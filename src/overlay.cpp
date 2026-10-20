@@ -24,6 +24,12 @@ extern "C" {
 #endif
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#ifdef CT_HAVE_SLANG
+#include "slang/slang_chain.h"
+#endif
 
 static SDL_Renderer* g_ren;
 static int g_ok;
@@ -56,7 +62,87 @@ static void fixDisplay(void) {
   if (w <= 0 || h <= 0) { w = 1280; h = 720; }
   io.DisplaySize = ImVec2((float)w, (float)h); io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 }
-extern "C" int CtOverlayInit(CtPresenter* pr) {
+extern "C" 
+// ---- THE SHADER SECTION of the Video tab (slang shaders, docs/SLANG.md): the preset in use, a file browser over the shaders/ folder, the shader's own parameters ----------------------------
+namespace {
+struct ShEntry { char name[96]; bool dir; };
+ShEntry g_shList[1024]; int g_shN = 0; char g_shDir[256] = ""; bool g_shScanned = false;       // g_shDir: the folder shown, relative to shaders/ ("" or "crt/")
+int shCmp(const void* a, const void* b) {
+  const ShEntry* x = (const ShEntry*)a; const ShEntry* y = (const ShEntry*)b;
+  if (x->dir != y->dir) return x->dir ? -1 : 1;
+  return strcmp(x->name, y->name);
+}
+void shScan() {
+  g_shN = 0; g_shScanned = true;
+  char path[400]; snprintf(path, sizeof path, "shaders/%s", g_shDir);
+  DIR* d = opendir(path); if (!d) return;
+  while (struct dirent* e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    char full[600]; snprintf(full, sizeof full, "%s%s", path, e->d_name);
+    struct stat st; bool dir = false;
+    if (e->d_type == DT_DIR) dir = true; else if (e->d_type == DT_UNKNOWN && stat(full, &st) == 0 && S_ISDIR(st.st_mode)) dir = true;
+    size_t l = strlen(e->d_name);
+    if (!dir && !(l > 7 && !strcmp(e->d_name + l - 7, ".slangp"))) continue;
+    if (g_shN < 1024) { snprintf(g_shList[g_shN].name, sizeof g_shList[g_shN].name, "%s", e->d_name); g_shList[g_shN].dir = dir; g_shN++; }
+  }
+  closedir(d);
+  qsort(g_shList, (size_t)g_shN, sizeof(ShEntry), shCmp);
+}
+void shaderUi(CtSettings* s, int* ch, CtPresenter* pr) {
+  ImGui::Separator();
+  ImGui::TextUnformatted("Shaders (slang presets)");
+  ImGui::TextDisabled("In use: %s", s->shader[0] ? s->shader : "none");
+  if (ImGui::Button("None")) { s->shader[0] = 0; *ch |= CT_OVL_VIDEO; }
+  ImGui::SameLine();
+  if (ImGui::Button("Rescan")) g_shScanned = false;
+  ImGui::SameLine();
+  ImGui::TextDisabled("folder: shaders/%s", g_shDir);
+  const char* st = CtPresentShaderStatus(pr);
+  if (st && st[0]) ImGui::TextWrapped("%s", st);
+  if (!g_shScanned) shScan();
+  if (g_shN == 0 && !g_shDir[0]) ImGui::TextDisabled("Put RetroArch slang presets (.slangp and their .slang files) in shaders/ next to the game.");
+  if (ImGui::BeginChild("##shlist", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 9.0f), true)) {
+    if (g_shDir[0] && ImGui::Selectable("[..]")) {                                // up one folder
+      char* e = g_shDir + strlen(g_shDir) - 1; if (*e == '/') *e = 0;
+      char* sl = strrchr(g_shDir, '/'); if (sl) sl[1] = 0; else g_shDir[0] = 0;
+      g_shScanned = false;
+    }
+    for (int i = 0; i < g_shN; i++) {
+      char lab[130]; snprintf(lab, sizeof lab, g_shList[i].dir ? "[%s]" : "%s", g_shList[i].name);
+      if (ImGui::Selectable(lab)) {
+        if (g_shList[i].dir) { size_t l = strlen(g_shDir); snprintf(g_shDir + l, sizeof g_shDir - l, "%s/", g_shList[i].name); g_shScanned = false; }
+        else { snprintf(s->shader, sizeof s->shader, "shaders/%s%s", g_shDir, g_shList[i].name); *ch |= CT_OVL_VIDEO; }
+      }
+    }
+  }
+  ImGui::EndChild();
+#ifdef CT_HAVE_SLANG
+  CtSlChain* c = (CtSlChain*)CtPresentShaderChain(pr);
+  if (c && CtSlChainPasses(c) > 0) {                                           // THE CAPTURE of every pass (debugging): one button, and its result stays on the screen
+    if (ImGui::Button("Capture every pass now (debugging)")) CtSlChainCaptureRequest(c);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Runs the preset one pass at a time, reads each pass's output back and saves it as an image in logs/slang_<preset>_<time>/ together with summary.txt (size, brightness,\n"
+                        "how much is non-black, whether a pass is identical to the one before). The screen freezes for a second or two. Send me that folder when a preset draws wrong.\n"
+                        "Capture a frame with a lot of colour in it (a field, not a black screen).");
+    const char* cs = CtSlChainCaptureStatus(c); if (cs && cs[0]) ImGui::TextWrapped("%s", cs);
+  }
+  if (c && CtSlChainParamCount(c) > 0 && ImGui::CollapsingHeader("Shader parameters")) {
+    if (ImGui::Button("Reset parameters")) CtSlChainParamsReset(c);
+    int n = CtSlChainParamCount(c);
+    ImGuiListClipper clip; clip.Begin(n);
+    while (clip.Step())
+      for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+        const CtSlChainParam* p = CtSlChainParamAt(c, i); float v = p->value;
+        ImGui::PushID(i);
+        if (ImGui::SliderFloat(p->def.desc[0] ? p->def.desc : p->def.id, &v, p->def.min, p->def.max, "%.3f")) CtSlChainParamSet(c, i, v);
+        ImGui::PopID();
+      }
+  }
+#endif
+}
+}  // namespace
+
+int CtOverlayInit(CtPresenter* pr) {
   if (g_ok) return 1;
   SDL_Window* win = CtPresentWindow(pr);
   g_hudWin = win; g_pr = pr;
@@ -343,6 +429,7 @@ extern "C" int CtOverlayFrame(void) {
 #endif
       }
       ImGui::TextDisabled("In use: %s", g_backendName);
+      shaderUi(s, &ch, g_pr);
       ImGui::TextDisabled("The video backend takes effect the next time the game starts.");
       ImGui::EndTabItem();
     }

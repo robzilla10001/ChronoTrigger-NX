@@ -297,6 +297,8 @@ static void hostApplyVideo(CtPresenter* pr) {
     }
   }
   CtPresentSetVsync(pr, st->vsync);                   // (the filter is the draw's: hostDrawPicture)
+  { static char lastShader[256] = "\x01";             // the slang shader preset: (re)loaded when the option changed (the micro-benchmarks measure the plain presenter)
+    if (CtBenchMode() < 2 && strcmp(lastShader, st->shader)) { snprintf(lastShader, sizeof lastShader, "%s", st->shader); CtPresentShaderSet(pr, st->shader); } }
 }
 static void dbgInit(void) {
   static int done; if (done) return; done = 1;   // once (guarded like ct_vm.c's dbgFlags)

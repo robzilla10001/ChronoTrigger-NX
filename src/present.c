@@ -14,6 +14,10 @@
 #include "bench.h"
 #include "settings.h"
 #include "overlay.h"
+#ifdef CT_HAVE_SLANG
+#include "slang/slang_gl.h"
+#include "slang/slang_chain.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,6 +123,10 @@ struct CtPresenter {
   // OpenGL
   SDL_GLContext ctx;
   GLuint_ glTex, glFbo;
+#ifdef CT_HAVE_SLANG
+  CtSlChain* slChain; CtSlGpuOps slOps; void* slDev; void* slOrig; unsigned long long slFrame;       // the slang shader chain (CtPresentShaderSet)
+#endif
+  char slStatus[600];
   GLuint_ glQ[2]; int glQi, glQarmed[2]; double glGpuMs; long glGpuSeq;    // timer queries around the draw, alternating: the last finished one is read without waiting
   GLuint_ hudTex, hudFbo; int hudW, hudH; char hudKey[1024];   // the HUD as a small texture blitted at the corner (no ImGui frame, no shader)
   int glLinear;
@@ -258,6 +266,11 @@ CtPresenter* CtPresentCreate(const CtPresentConfig* c) {
 void CtPresentDestroy(CtPresenter* p) {
   if (!p) return;
   presentStop(p);
+  CtPresentShaderSet(p, NULL);                      // (the chain's GL objects go while the context is alive; a Vulkan chain goes with CtVkStop)
+#ifdef CT_HAVE_SLANG
+  if (p->slDev) { CtSlGlDestroy(p->slDev); p->slDev = NULL; }
+  if (p->slOrig) { CtSlGlWrapFree(p->slOrig); p->slOrig = NULL; }
+#endif
   free(p->stg[0]); free(p->stg[1]);
 #ifdef CT_HAVE_VULKAN
   if (p->vk) CtVkStop(p->vk);
@@ -496,7 +509,17 @@ int CtPresentUploadScaled(CtPresenter* p, const uint8_t* rgb, int w, int k) {
   if (!p || k < 1 || p->picW != w * k || p->picH % k) return 0;
   if (p->backend != CT_BACKEND_SDL) {                // the GPU backends: upload the 1x source, the GPU stretches it (nearest only: a linear filter would blur what the k-times copy keeps sharp)
     static int off = -1; if (off < 0) off = getenv("CT_NO_GPU_SCALE") != NULL;      // (A/B switch: the CPU upscale)
-    if (off || k == 1 || CtSettingsGet()->linearFilter) return 0;
+    int chain = 0;
+#ifdef CT_HAVE_SLANG
+    chain = p->slChain != NULL;                      // (a shader chain wants the 1x frame whatever the filter: it does its own scaling)
+#endif
+#ifdef CT_HAVE_VULKAN
+    if (p->backend == CT_BACKEND_VULKAN) chain = CtVkShaderWanted(p->vk);
+#endif
+#ifdef CT_HAVE_DEKO3D
+    if (p->backend == CT_BACKEND_DEKO3D) chain = CtDkShaderWanted(p->dk);
+#endif
+    if (off || k == 1 || (CtSettingsGet()->linearFilter && !chain)) return 0;
     if (!gpuTexSet(p, w, p->picH / k)) return 0;
     presentUpload(p, rgb);                           // (times itself)
     return 1;
@@ -520,6 +543,61 @@ int CtPresentUploadScaled(CtPresenter* p, const uint8_t* rgb, int w, int k) {
   if (!p->async) SDL_UpdateTexture(p->tex, NULL, g_cvBuf, p->picW * 4);
   CtStatsPresent(CT_ST_UPLOAD, statsNow() - st0);
   return 1;
+}
+
+// ---- slang shaders ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#ifdef CT_HAVE_SLANG
+static void* slGlProc(const char* n) { return SDL_GL_GetProcAddress(n); }
+#endif
+int CtPresentShaderSet(CtPresenter* p, const char* path) {
+  if (!p) return 0;
+#ifdef CT_HAVE_SLANG
+  if (p->slChain) { CtSlChainFree(p->slChain); p->slChain = NULL; }
+  p->slStatus[0] = 0;
+#ifdef CT_HAVE_VULKAN
+  if (p->backend == CT_BACKEND_VULKAN) return CtVkShaderSet(p->vk, path) && path && *path;     // (loaded at the start of the next frame; the status follows)
+#endif
+#ifdef CT_HAVE_DEKO3D
+  if (p->backend == CT_BACKEND_DEKO3D) return CtDkShaderSet(p->dk, path) && path && *path;
+#endif
+  if (!path || !*path) return 0;
+  if (p->backend != CT_BACKEND_OPENGL) { snprintf(p->slStatus, sizeof p->slStatus, "slang shaders need the OpenGL, Vulkan or deko3d backend"); return 0; }
+  char err[512];
+  if (!p->slDev && CtSlGlCreate(slGlProc, &p->slOps, &p->slDev, err, sizeof err)) { snprintf(p->slStatus, sizeof p->slStatus, "%s", err); return 0; }
+  if (!p->slOrig) p->slOrig = CtSlGlWrap(p->slDev, 0, 0, 1, 1);
+  double t0 = statsNow();
+  char e2[2048]; CtSlChain* c = CtSlChainLoad(path, &p->slOps, p->slDev, NULL, NULL, e2, sizeof e2);
+  if (!c) { snprintf(p->slStatus, sizeof p->slStatus, "%s", e2); fprintf(stderr, "[slang] %s: %s\n", path, e2); fflush(stderr); return 0; }
+  p->slChain = c; p->slFrame = 0;
+  snprintf(p->slStatus, sizeof p->slStatus, "%s: %d passes, %d parameters, loaded in %.1f s%s%s", path, CtSlChainPasses(c), CtSlChainParamCount(c), (statsNow() - t0) / 1000.0,
+           CtSlChainWarnings(c)[0] ? "; warnings: " : "", CtSlChainWarnings(c));
+  fprintf(stderr, "[slang] %s\n", p->slStatus); fflush(stderr);
+  return 1;
+#else
+  (void)path; snprintf(p->slStatus, sizeof p->slStatus, "this build has no slang shader support"); return 0;
+#endif
+}
+const char* CtPresentShaderStatus(CtPresenter* p) {
+#ifdef CT_HAVE_VULKAN
+  if (p && p->backend == CT_BACKEND_VULKAN) return CtVkShaderStatus(p->vk);
+#endif
+#ifdef CT_HAVE_DEKO3D
+  if (p && p->backend == CT_BACKEND_DEKO3D) return CtDkShaderStatus(p->dk);
+#endif
+  return p ? p->slStatus : "";
+}
+void* CtPresentShaderChain(CtPresenter* p) {
+#ifdef CT_HAVE_VULKAN
+  if (p && p->backend == CT_BACKEND_VULKAN) return CtVkShaderChain(p->vk);
+#endif
+#ifdef CT_HAVE_DEKO3D
+  if (p && p->backend == CT_BACKEND_DEKO3D) return CtDkShaderChain(p->dk);
+#endif
+#ifdef CT_HAVE_SLANG
+  return p ? (void*)p->slChain : NULL;
+#else
+  (void)p; return NULL;
+#endif
 }
 
 void CtPresentSetPicSize(CtPresenter* p, int w, int h) {
@@ -584,11 +662,25 @@ void CtPresentDraw(CtPresenter* p, const SDL_Rect* dst, int linear) {
     }
     gl.ClearColor(0, 0, 0, 1); gl.Clear(CTGL_COLOR_BUFFER_BIT);
     SDL_Rect d = dst ? *dst : (SDL_Rect){ 0, 0, ow, oh };
+#ifdef CT_HAVE_SLANG
+    if (p->slChain) {                                                                   // THE SLANG CHAIN draws the picture into the rectangle (a failed run falls back to the blit)
+      CtSlGlWrapSet(p->slOrig, p->glTex, p->glFbo, p->texW, p->texH);
+      if (CtSlChainCapturePending(p->slChain)) CtSlChainCaptureAuto(p->slChain);              // (a capture of every pass was asked for)
+      CtSlGlSetBackbuffer(p->slDev, 0, oh);
+      CtSlFrame fr = { p->slOrig, p->texW, p->texH, p->slFrame++, { d.x, d.y, d.w, d.h }, linear, 60.0f, d.h > 0 ? (float)d.w / (float)d.h : 0.0f };
+      if (!CtSlChainRun(p->slChain, &fr)) goto slangDrawn;
+      snprintf(p->slStatus, sizeof p->slStatus, "the shader chain failed to run; drawing the plain picture");
+      CtSlChainFree(p->slChain); p->slChain = NULL;
+    }
+#endif
     gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, p->glFbo);
     // GL's rows count up from the bottom: the frame's row 0 (its top) goes to the rectangle's top edge, oh - d.y
     gl.BlitFramebuffer(0, 0, p->texW, p->texH, d.x, oh - d.y, d.x + d.w, oh - d.y - d.h, CTGL_COLOR_BUFFER_BIT,
                        linear ? CTGL_LINEAR : CTGL_NEAREST);
     gl.BindFramebuffer(CTGL_READ_FRAMEBUFFER, 0);
+#ifdef CT_HAVE_SLANG
+  slangDrawn:;
+#endif
     if (p->glQarmed[p->glQi] == 2) { gl.EndQuery(CTGL_TIME_ELAPSED); p->glQarmed[p->glQi] = 1; p->glQi ^= 1; }
     return;
   }

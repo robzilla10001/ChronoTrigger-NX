@@ -19,6 +19,11 @@ void        CtDkSetVsync(CtDk* d, int on);
 void        CtDkUpload(CtDk* d, const uint8_t* rgb24);
 void        CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear);          // starts the frame: clear + the picture into `dst` (NULL = all)
 int         CtDkSetPicSize(CtDk* d, int w, int h);
+// SLANG SHADERS (src/slang/slang_dk.cpp; shaders compiled on the console by uam): the preset is (re)loaded at the start of the next frame. "" / NULL = off.
+int         CtDkShaderSet(CtDk* d, const char* path);
+const char* CtDkShaderStatus(CtDk* d);
+void*       CtDkShaderChain(CtDk* d);
+int         CtDkShaderWanted(CtDk* d);
 void        CtDkSwap(CtDk* d);                                           // submit, present
 // Dear ImGui over the frame being recorded (between Draw and Swap).
 int         CtDkImGuiInit(CtDk* d);                                      // the font texture; 1 = ok

@@ -27,6 +27,31 @@ add_executable(ct_field ${CT_SRC} ${XLAT_SRC} ${SNES_SRC} ${ROOT}/src/overlay.cp
   ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
   ${ROOT}/src/present_dk.cpp
   ${IMGUI}/backends/imgui_impl_sdl2.cpp ${IMGUI}/backends/imgui_impl_sdlrenderer2.cpp ${IMGUI}/backends/imgui_impl_opengl3.cpp)
+# SLANG SHADERS (src/slang, docs/SLANG.md): RetroArch .slangp presets run over the picture on the GPU. glslang and SPIRV-Cross come from third_party/slang-switch
+# (sh switch/get_slang.sh); without that folder, or with -DCT_WITHOUT_SLANG=ON, the program is built without shader support and everything else is unchanged.
+option(CT_WITHOUT_SLANG "build without the slang shader support" OFF)
+set(SL ${ROOT}/third_party/slang-switch)
+if(NOT CT_WITHOUT_SLANG AND EXISTS ${SL}/lib/libglslang.a)
+  message(STATUS "Shaders: slang support from ${SL}")
+  target_sources(ct_field PRIVATE ${ROOT}/src/slang/slang_preset.c ${ROOT}/src/slang/slang_source.c ${ROOT}/src/slang/slang_chain.c ${ROOT}/src/slang/slang_image.c
+    ${ROOT}/src/slang/slang_gl.c ${ROOT}/src/slang/slang_vk.c ${ROOT}/src/slang/slang_compile.cpp)
+  if(NOT CT_WITHOUT_DEKO3D AND EXISTS ${SL}/lib/libuam.a)
+    target_sources(ct_field PRIVATE ${ROOT}/src/slang/slang_dk.cpp)
+    set_source_files_properties(${ROOT}/src/slang/slang_dk.cpp PROPERTIES COMPILE_OPTIONS "-fno-exceptions;-fno-rtti")
+    target_compile_definitions(ct_field PRIVATE CT_HAVE_SLANG_DK)
+    set(CT_UAM_LIB ${SL}/lib/libuam.a)
+  else()
+    message(STATUS "Shaders: deko3d runs without them (no libuam.a: sh switch/get_uam.sh)")
+  endif()
+  set_source_files_properties(${ROOT}/src/slang/slang_compile.cpp PROPERTIES COMPILE_OPTIONS "-std=gnu++17")
+  target_compile_definitions(ct_field PRIVATE CT_HAVE_SLANG CT_HAVE_PNG)
+  target_include_directories(ct_field PRIVATE ${ROOT}/src/slang ${SL}/include ${SL}/include/glslang ${SL}/include/spirv_cross)
+  set(CT_SLANG_LIBS -Wl,--start-group ${SL}/lib/libspirv-cross-glsl.a ${SL}/lib/libspirv-cross-core.a ${SL}/lib/libglslang-default-resource-limits.a
+    ${SL}/lib/libglslang.a ${SL}/lib/libSPIRV.a ${SL}/lib/libMachineIndependent.a ${SL}/lib/libGenericCodeGen.a ${SL}/lib/libOSDependent.a -Wl,--end-group ${CT_UAM_LIB} png16 z)
+else()
+  set(CT_SLANG_LIBS "")
+  message(STATUS "Shaders: third_party/slang-switch not found (sh switch/get_slang.sh) -- built without slang shader support")
+endif()
 # BISECTING THE EXIT DIALOG (docs/SWITCH.md): CT_WITHOUT_DEKO3D / CT_WITHOUT_VULKAN leave those backends, and their libraries, out of a build.
 option(CT_WITHOUT_DEKO3D "build without the deko3d backend" OFF)
 option(CT_WITHOUT_VULKAN "build without the Vulkan backend" OFF)
@@ -82,7 +107,7 @@ if(CT_MESA_UNIFIED)
   # the archives repeat shared helper code (each is a fat static library of the same Mesa): the copies are identical, first wins
   target_link_libraries(ct_field PRIVATE SDL2 glad -Wl,--allow-multiple-definition -Wl,--start-group
     ${MU}/lib/libEGL.a ${MU}/lib/libGLESv2.a ${MU}/lib/libGLESv1_CM.a ${MU}/lib/libglapi.a ${MU}/lib/libvulkan.a ${MU_RUST} -Wl,--end-group
-    zstd expat z deko3d stdc++ m)
+    ${CT_SLANG_LIBS} zstd expat z deko3d stdc++ m)
   nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C) - Mesa" AUTHOR "ChronoTrigger-NX" VERSION "0.6b")
   nx_create_nro(ct_field NACP ct_field.nacp)
   return()
@@ -100,6 +125,6 @@ if(NOT CT_WITHOUT_VULKAN AND EXISTS ${MESA}/nvk_vulkan.o AND EXISTS ${IMGUI}/bac
 else()
   message(STATUS "Vulkan: third_party/mesa-switch not found (sh switch/get_mesa.sh) -- built without it")
 endif()
-target_link_libraries(ct_field PRIVATE ${CT_VULKAN_LIBS} SDL2 glad EGL glapi drm_nouveau ${CT_DK_LIB} stdc++ m)
+target_link_libraries(ct_field PRIVATE ${CT_VULKAN_LIBS} ${CT_SLANG_LIBS} SDL2 glad EGL glapi drm_nouveau ${CT_DK_LIB} stdc++ m)
 nx_generate_nacp(ct_field.nacp NAME "Chrono Trigger (C)" AUTHOR "ChronoTrigger-NX" VERSION "0.6b")
 nx_create_nro(ct_field NACP ct_field.nacp)

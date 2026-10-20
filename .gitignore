@@ -135,3 +135,5 @@ tools/_*
 /src/viewer.c
 /logs/
 ct_bench_state
+/third_party/_slang_src/
+/third_party/slang-switch/

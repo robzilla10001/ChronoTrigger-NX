@@ -23,6 +23,11 @@ void        CtVkDraw(CtVk* v, const SDL_Rect* dst, int linear);
 int         CtVkSetPicSize(CtVk* v, int w, int h);
 void        CtVkSwap(CtVk* v);
 int         CtVkSaveBMP(CtVk* v, const char* path);
+// SLANG SHADERS (src/slang/slang_vk.c): the preset is (re)loaded at the start of the next frame. "" / NULL = off. The status is one line for the menu; the chain is a CtSlChain* (its parameters).
+int         CtVkShaderSet(CtVk* v, const char* path);
+const char* CtVkShaderStatus(CtVk* v);
+void*       CtVkShaderChain(CtVk* v);
+int         CtVkShaderWanted(CtVk* v);                 // a preset is chosen and has not failed: the 1x picture goes up, the chain does the scaling
 int         CtVkInfoGet(CtVk* v, CtVkInfo* out);
 void*       CtVkCommandBuffer(CtVk* v);   // the frame being recorded (between Draw and Swap), else NULL
 void*       CtVkProc(CtVk* v, const char* name);   // vkGetInstanceProcAddr(instance, name)

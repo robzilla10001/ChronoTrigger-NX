@@ -44,6 +44,7 @@ typedef struct CtSettings {
   int wideRoomWrap;             // widescreen: a room as wide as its map shows the map wrapping in the sides (else black)
   int vsync;
   int backend;                  // present.h CT_BACKEND_*: SDL_Renderer / OpenGL / Vulkan (PC) / deko3d (Switch), applied at the next start
+  char shader[256];             // a RetroArch slang preset (.slangp) run over the picture (src/slang; "" = none): a path relative to the program's folder, or absolute
   char renderDriver[32];        // SDL_Renderer driver ("" = SDL's choice; "direct3d", "direct3d11", "opengl", "software")
   // sound
   int volume;                   // 0..100, the host's output gain

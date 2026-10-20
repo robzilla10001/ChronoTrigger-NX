@@ -5,6 +5,10 @@
 // Coordinates: clip space +y is up; the scissor and the viewport count rows from the TOP of the image (deko3d's default window
 // origin is the upper left). If the overlay's clipping ever shows mirrored, CT_DK_SCISSOR_FLIP below is the one place to look.
 #include "present_dk.h"
+#ifdef CT_HAVE_SLANG_DK
+#include "slang/slang_dk.h"
+#include "slang/slang_chain.h"
+#endif
 #include <switch.h>
 #include <deko3d.h>
 #include <stdio.h>
@@ -20,7 +24,7 @@
 
 #include "dk/dk_shaders.inc"
 
-enum { FRAMES = 3, FB_NUM = 2, CMD_BYTES = 256 * 1024, DYN_BYTES = 4 * 1024 * 1024, DYN_UNI = 4096, MAX_IMG = 4, MAX_SMP = 4 };
+enum { FRAMES = 3, FB_NUM = 2, CMD_BYTES = 1024 * 1024, DYN_BYTES = 4 * 1024 * 1024, DYN_UNI = 4096, MAX_IMG = 4, MAX_SMP = 4 };
 enum { IMG_PIC = 0, IMG_FONT = 1, SMP_NEAREST = 0, SMP_LINEAR = 1 };
 
 // deko3d's own report of what it refused, in the log (the run is usually about to end on it).
@@ -32,6 +36,9 @@ static void dkDebug(void* user, const char* context, DkResult result, const char
 static void screenSize(int* w, int* h) { *w = 1920; *h = 1080; }
 static uint32_t up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
+#ifdef CT_HAVE_SLANG_DK
+struct CtDk; static void slStop(struct CtDk* d);
+#endif
 struct Frame {
   DkMemBlock cmdMem, dynMem, stageMem; uint32_t stageBytes; int repArmed;       // repArmed: the two GPU timestamps of this frame are on their way
   DkCmdBuf cb; DkFence fence; int fenced;
@@ -48,6 +55,7 @@ struct CtDk {
   int recording, slot, uploaded;                          // a frame is open in fr[cur].cb on swapchain image `slot`
   double lastGpuMs, waitedMs; long gpuSeq;                 // the GPU time of the last frame that finished, how long the CPU has blocked on fences, and a counter of new GPU times
   char name[96];
+  struct SlDk* sl;                                        // the slang shader chain (slang_dk.h), created on the first CtDkShaderSet
 };
 
 #define REPORT_OFF 1024                                           // in a frame's dynamic block: two 16-byte timestamp reports (the uniforms use the first 256 bytes)
@@ -170,6 +178,9 @@ extern "C" int CtDkStart(SDL_Window* win, int vsync, int picW, int picH, CtDk** 
 extern "C" void CtDkStop(CtDk* d) {
   if (!d) return;
   if (d->q) dkQueueWaitIdle(d->q);
+#ifdef CT_HAVE_SLANG_DK
+  slStop(d);
+#endif
   for (int i = 0; i < FRAMES; i++) {
     Frame* f = &d->fr[i];
     if (f->cb) dkCmdBufDestroy(f->cb);
@@ -221,6 +232,73 @@ static void bindBase(CtDk* d, Frame* f) {
   dkCmdBufBindSamplerDescriptorSet(f->cb, dkMemBlockGetGpuAddr(d->descMem) + descOff(1, 0), MAX_SMP);
 }
 
+
+// ---- the slang shader chain (src/slang/slang_dk.cpp): a preset's passes between the picture's upload and the overlay ---------------------------------------------------------------------------------
+#ifdef CT_HAVE_SLANG_DK
+struct SlDk {
+  CtSlChain* chain; CtSlGpuOps ops; void* dev; void* orig;
+  char status[600]; char path[256]; int pending, failed; unsigned long long frame;
+};
+static void slStop(CtDk* d) {                                      // (the queue is idle)
+  if (!d->sl) return;
+  if (d->sl->chain) { CtSlChainFree(d->sl->chain); d->sl->chain = NULL; }
+  if (d->sl->orig) { CtSlDkWrapFree(d->sl->dev, d->sl->orig); d->sl->orig = NULL; }
+  if (d->sl->dev) { CtSlDkDestroy(d->sl->dev); d->sl->dev = NULL; }
+  free(d->sl); d->sl = NULL;
+}
+// A requested preset is (re)loaded at the start of a frame, before any command is recorded.
+static void slApply(CtDk* d) {
+  struct SlDk* s = d->sl; s->pending = 0; s->failed = 0; s->status[0] = 0;
+  if (s->chain) { dkQueueWaitIdle(d->q); CtSlChainFree(s->chain); s->chain = NULL; }
+  if (s->dev) CtSlDkFrameStart(s->dev);                            // (what the old chain left is freed now)
+  if (!s->path[0]) return;
+  char err[2048];
+  if (!s->dev) {
+    if (CtSlDkCreate(d->dev, d->q, &s->ops, &s->dev, err, sizeof err)) { snprintf(s->status, sizeof s->status, "%s", err); return; }
+    s->orig = CtSlDkWrap(s->dev, &d->pic, d->picW, d->picH);
+  }
+  double t0 = nowMsDk();
+  CtSlChain* c = CtSlChainLoad(s->path, &s->ops, s->dev, NULL, NULL, err, sizeof err);
+  if (!c) { snprintf(s->status, sizeof s->status, "%s", err); fprintf(stderr, "[slang] %s: %s\n", s->path, err); fflush(stderr); return; }
+  s->chain = c; s->frame = 0; d->uploaded = 1;
+  snprintf(s->status, sizeof s->status, "%s: %d passes, %d parameters, loaded in %.1f s%s%s", s->path, CtSlChainPasses(c), CtSlChainParamCount(c), (nowMsDk() - t0) / 1000.0,
+           CtSlChainWarnings(c)[0] ? "; warnings: " : "", CtSlChainWarnings(c));
+  fprintf(stderr, "[slang] %s\n", s->status); fflush(stderr);
+}
+static void bindBase(CtDk* d, Frame* f);
+// Run the chain into `rc` (the swapchain image is bound and cleared). 1 = it drew; the host's state is restored by the caller. 0 = it did not (draw the plain picture).
+static int slRun(CtDk* d, Frame* f, SDL_Rect rc, int linear) {
+  struct SlDk* s = d->sl;
+  CtSlDkWrapSet(s->dev, s->orig, &d->pic, d->picW, d->picH);
+  CtSlFrame fr = { s->orig, d->picW, d->picH, s->frame++, { rc.x, rc.y, rc.w, rc.h }, linear, 60.0f, rc.h > 0 ? (float)rc.w / (float)rc.h : 0.0f };
+  CtSlDkBeginFrame(s->dev, f->cb, d->cur);
+  CtSlDkSetBackbuffer(s->dev, &d->fb[d->slot]);
+  int bad = CtSlChainRun(s->chain, &fr);
+  DkImageView target; dkImageViewDefaults(&target, &d->fb[d->slot]);        // the host's state back: the swapchain image, the whole viewport, its own descriptor sets
+  dkCmdBufBindRenderTarget(f->cb, &target, NULL);
+  bindBase(d, f);
+  DkViewport vp = { 0.0f, 0.0f, (float)d->fbW, (float)d->fbH, 0.0f, 1.0f }; DkScissor sc = { 0, 0, (uint32_t)d->fbW, (uint32_t)d->fbH };
+  dkCmdBufSetViewports(f->cb, 0, &vp, 1); dkCmdBufSetScissors(f->cb, 0, &sc, 1);
+  if (bad) { s->failed = 1; snprintf(s->status, sizeof s->status, "the shader chain failed to run; drawing the plain picture"); return 0; }
+  return 1;
+}
+extern "C" int CtDkShaderSet(CtDk* d, const char* path) {
+  if (!d) return 0;
+  if (!d->sl) { if (!path || !*path) return 0; d->sl = (struct SlDk*)calloc(1, sizeof *d->sl); if (!d->sl) return 0; }
+  snprintf(d->sl->path, sizeof d->sl->path, "%s", path ? path : ""); d->sl->pending = 1;
+  snprintf(d->sl->status, sizeof d->sl->status, "%s", path && *path ? "loading..." : "");
+  return 1;
+}
+extern "C" const char* CtDkShaderStatus(CtDk* d) { return d && d->sl ? d->sl->status : ""; }
+extern "C" void* CtDkShaderChain(CtDk* d) { return d && d->sl ? (void*)d->sl->chain : NULL; }
+extern "C" int CtDkShaderWanted(CtDk* d) { return d && d->sl && d->sl->path[0] && !d->sl->failed; }
+#else
+extern "C" int CtDkShaderSet(CtDk*, const char*) { return 0; }
+extern "C" const char* CtDkShaderStatus(CtDk*) { return "this build has no slang shader support"; }
+extern "C" void* CtDkShaderChain(CtDk*) { return NULL; }
+extern "C" int CtDkShaderWanted(CtDk*) { return 0; }
+#endif
+
 extern "C" void CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear) {
   if (d->recording) return;
   { int w, h; screenSize(&w, &h);                                       // (a swapchain of another size: rebuilt)
@@ -230,6 +308,15 @@ extern "C" void CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear) {
     } }
   Frame* f = &d->fr[d->cur];
   waitFrame(d, f);
+#ifdef CT_HAVE_SLANG_DK
+  if (d->sl && d->sl->pending) slApply(d);
+  else if (d->sl && d->sl->dev) CtSlDkFrameStart(d->sl->dev);
+  if (d->sl && d->sl->chain && !d->sl->failed && CtSlChainCapturePending(d->sl->chain)) {      // a capture of every pass was asked for: now, before this frame is recorded (the GPU is idle here)
+    CtSlDkWrapSet(d->sl->dev, d->sl->orig, &d->pic, d->picW, d->picH);
+    dkQueueWaitIdle(d->q);
+    CtSlChainCaptureAuto(d->sl->chain);
+  }
+#endif
   dkCmdBufClear(f->cb);
   d->slot = dkQueueAcquireImage(d->q, d->sc);
   d->recording = 1;
@@ -254,6 +341,12 @@ extern "C" void CtDkDraw(CtDk* d, const SDL_Rect* dst, int linear) {
   // the quad: the destination in clip space (+y up)
   float x0 = 0, y0 = 0, x1 = (float)d->fbW, y1 = (float)d->fbH;
   if (dst) { x0 = (float)dst->x; y0 = (float)dst->y; x1 = (float)(dst->x + dst->w); y1 = (float)(dst->y + dst->h); }
+#ifdef CT_HAVE_SLANG_DK
+  if (d->sl && d->sl->chain && !d->sl->failed && x1 > x0 && y1 > y0) {                                // THE SLANG CHAIN draws the picture into the rectangle
+    SDL_Rect rc = { (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0) };
+    if (slRun(d, f, rc, linear)) return;
+  }
+#endif
   float rect[4] = { 2.0f * x0 / d->fbW - 1.0f, 1.0f - 2.0f * y0 / d->fbH, 2.0f * x1 / d->fbW - 1.0f, 1.0f - 2.0f * y1 / d->fbH };
   DkGpuAddr uni = dkMemBlockGetGpuAddr(f->dynMem);
   dkCmdBufPushConstants(f->cb, uni, DK_UNIFORM_BUF_ALIGNMENT, 0, sizeof rect, rect);
